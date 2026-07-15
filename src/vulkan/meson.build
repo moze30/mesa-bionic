@@ -54,7 +54,8 @@ if with_platform_wayland
   vulkan_wsi_deps += dep_wayland_client
   vulkan_wsi_list += '-DVK_USE_PLATFORM_WAYLAND_KHR'
 endif
-if system_has_kms_drm and not with_platform_android
+if system_has_kms_drm and not with_platform_android and \
+   cc.has_function('pthread_cancel', dependencies : dep_thread)
   vulkan_wsi_deps += [dep_libdrm, dep_display_info]
   vulkan_wsi_list += '-DVK_USE_PLATFORM_DISPLAY_KHR'
 endif

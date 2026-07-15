@@ -107,6 +107,7 @@ struct wsi_wl_display {
    struct wl_fixes *wl_fixes;
 
    struct wl_shm *wl_shm;
+   uint32_t wl_shm_name;
    struct zwp_linux_dmabuf_v1 *wl_dmabuf;
    struct zwp_linux_dmabuf_feedback_v1 *wl_dmabuf_feedback;
    struct wp_tearing_control_manager_v1 *tearing_control_manager;
@@ -1409,12 +1410,16 @@ registry_handle_global(void *data, struct wl_registry *registry,
 {
    struct wsi_wl_display *display = data;
 
-   if (display->sw) {
-      if (strcmp(interface, wl_shm_interface.name) == 0) {
+   if (strcmp(interface, wl_shm_interface.name) == 0) {
+      if (display->sw) {
          display->wl_shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
          wl_shm_add_listener(display->wl_shm, &shm_listener, display);
+      } else {
+         display->wl_shm_name = name;
       }
-   } else {
+   }
+
+   if (!display->sw) {
       if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0 && version >= 3) {
          display->wl_dmabuf =
             wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface,
@@ -1559,6 +1564,16 @@ wsi_wl_display_init(struct wsi_wayland *wsi_wl,
 
    /* Round-trip to get wl_shm and zwp_linux_dmabuf_v1 globals */
    wl_display_roundtrip_queue(display->wl_display, display->queue);
+   if (!display->wl_dmabuf && !display->wl_shm && display->wl_shm_name) {
+      display->wl_shm = wl_registry_bind(registry, display->wl_shm_name,
+                                         &wl_shm_interface, 1);
+      if (!display->wl_shm) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto fail_registry;
+      }
+      wl_shm_add_listener(display->wl_shm, &shm_listener, display);
+   }
+
    if (!display->wl_dmabuf && !display->wl_shm) {
       result = VK_ERROR_SURFACE_LOST_KHR;
       goto fail_registry;
@@ -3741,11 +3756,13 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    struct wsi_drm_image_params drm_image_params;
    uint32_t num_drm_modifiers = 0;
    const uint64_t *drm_modifiers = NULL;
-   if (wsi_device->sw) {
+   bool use_shm = !wsi_wl_surface->display->wl_dmabuf &&
+                  wsi_wl_surface->display->wl_shm;
+   if (wsi_device->sw || use_shm) {
       cpu_image_params = (struct wsi_cpu_image_params) {
          .base.image_type = WSI_IMAGE_TYPE_CPU,
       };
-      if (wsi_device->has_import_memory_host &&
+      if (wsi_device->sw && wsi_device->has_import_memory_host &&
           !(WSI_DEBUG & WSI_DEBUG_NOSHM)) {
          buffer_type = WSI_WL_BUFFER_GPU_SHM;
          cpu_image_params.alloc_shm = wsi_wl_alloc_image_shm;
@@ -3896,7 +3913,7 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
                                                   WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC);
    }
 
-   if (wsi_wl_use_explicit_sync(dpy, wsi_device)) {
+   if (chain->base.image_info.explicit_sync) {
       chain->wl_syncobj_surface =
          wp_linux_drm_syncobj_manager_v1_get_surface(dpy->wl_syncobj,
                                                      chain->wsi_wl_surface->wayland_surface.wrapper);

@@ -573,9 +573,11 @@ wsi_swapchain_init(const struct wsi_device *wsi,
       goto fail;
 
 #ifdef HAVE_LIBDRM
-   result = wsi_drm_init_swapchain_implicit_sync(chain);
-   if (result != VK_SUCCESS)
-      goto fail;
+   if (chain->image_info.image_type == WSI_IMAGE_TYPE_DRM) {
+      result = wsi_drm_init_swapchain_implicit_sync(chain);
+      if (result != VK_SUCCESS)
+         goto fail;
+   }
 #endif
 
    if ((pCreateInfo->flags & VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT) ||
@@ -2877,9 +2879,12 @@ wsi_common_queue_present(const struct wsi_device *wsi,
 #endif
       }
 
-      if (wsi->sw) {
-         wsi->WaitForFences(vk_device_to_handle(dev),
-                            1, &swapchain->fences[image_index], true, ~0ull);
+      if (swapchain->image_info.image_type == WSI_IMAGE_TYPE_CPU) {
+         results[i] = wsi->WaitForFences(vk_device_to_handle(dev),
+                                         1, &swapchain->fences[image_index],
+                                         true, ~0ull);
+         if (results[i] != VK_SUCCESS)
+            continue;
       }
 
       const VkPresentRegionKHR *region = NULL;
