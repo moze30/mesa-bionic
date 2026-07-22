@@ -704,7 +704,20 @@ eglInitialize(EGLDisplay dpy, EGLint *major, EGLint *minor)
                success = _eglDriver.Initialize(disp);
             }
             if (!success) {
-               disp->Options.Zink = EGL_FALSE;
+               /*
+                * DRM render-node path failed (common in Android containers).
+                * Fall back to the software/kopper Wayland path.
+                *
+                * If Zink was already selected (MESA_LOADER_DRIVER_OVERRIDE=zink
+                * or GALLIUM_DRIVER=zink), keep it so OpenGL still runs on the
+                * GPU via Vulkan. Clearing Zink here forces swrast and leaves
+                * no EGL_OPENGL_BIT configs for Wine.
+                */
+               const char *gallium = os_get_option("GALLIUM_DRIVER");
+               const bool want_zink =
+                  disp->Options.Zink ||
+                  (gallium && !strcmp(gallium, "zink"));
+               disp->Options.Zink = want_zink;
                disp->Options.ForceSoftware = EGL_TRUE;
                if (!_eglDriver.Initialize(disp))
                   RETURN_EGL_ERROR(disp, EGL_NOT_INITIALIZED, EGL_FALSE);
