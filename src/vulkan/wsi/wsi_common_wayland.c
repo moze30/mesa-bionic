@@ -1766,6 +1766,13 @@ wsi_wl_surface_get_support(VkIcdSurfaceBase *surface,
  */
 #define WSI_WL_BUMPED_NUM_IMAGES 4
 
+/* The wl_shm path hands a buffer to the compositor and cannot reuse it until
+ * the compositor sends wl_buffer.release, which only happens once per repaint.
+ * An application rendering much faster than the compositor repaints therefore
+ * runs out of images and blocks in AcquireNextImage. Keep a deeper pool so
+ * there is normally always one free. */
+#define WSI_WL_SHM_NUM_IMAGES 6
+
 /* Catch-all. 3 images is a sound default for everything except MAILBOX. */
 #define WSI_WL_DEFAULT_NUM_IMAGES 3
 
@@ -3788,7 +3795,9 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    /* We need to allocate the chain handle early, since display initialization code relies on it.
     * We do not know the actual image count until we have initialized the display handle,
     * so allocate conservatively in case we need to bump the image count. */
-   size_t size = sizeof(*chain) + MAX2(WSI_WL_BUMPED_NUM_IMAGES, pCreateInfo->minImageCount) * sizeof(chain->images[0]);
+   size_t size = sizeof(*chain) +
+                 MAX2(MAX2(WSI_WL_BUMPED_NUM_IMAGES, WSI_WL_SHM_NUM_IMAGES),
+                      pCreateInfo->minImageCount) * sizeof(chain->images[0]);
    chain = vk_zalloc(pAllocator, size, 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (chain == NULL)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -3924,6 +3933,14 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       buffer_type = WSI_WL_BUFFER_NATIVE;
       image_params = &drm_image_params.base;
    }
+
+   /* See WSI_WL_SHM_NUM_IMAGES: the memcpy path is throttled by the
+    * compositor's release cadence rather than by our own submissions, so give
+    * it a deeper pool to hide that latency. */
+   if (buffer_type == WSI_WL_BUFFER_SHM_MEMCPY &&
+       present_mode != VK_PRESENT_MODE_FIFO_KHR &&
+       present_mode != VK_PRESENT_MODE_FIFO_RELAXED_KHR)
+      num_images = MAX2(num_images, WSI_WL_SHM_NUM_IMAGES);
 
    result = wsi_swapchain_init(wsi_device, &chain->base, device,
                                pCreateInfo, image_params, pAllocator);
