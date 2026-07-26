@@ -175,6 +175,9 @@ enum wsi_wl_buffer_type {
    WSI_WL_BUFFER_SHM_MEMCPY,
 };
 
+struct wsi_wl_swapchain;
+static VkResult wsi_wl_swapchain_flush_deferred(struct wsi_wl_swapchain *chain);
+
 struct wsi_wl_surface {
    VkIcdSurfaceWayland base;
 
@@ -189,6 +192,8 @@ struct wsi_wl_surface {
    struct vk_instance *instance;
 };
 
+#define WSI_WL_MAX_DEFER_DAMAGE_RECTS 16
+
 struct wsi_wl_swapchain {
    struct wsi_swapchain base;
 
@@ -199,6 +204,21 @@ struct wsi_wl_swapchain {
    struct wp_linux_drm_syncobj_surface_v1 *wl_syncobj_surface;
 
    struct wl_callback *frame;
+
+   /* Deferred present state. For the wl_shm path the CPU must wait for the
+    * app's rendering (and our blit) to land in host memory before it can copy
+    * the image into the shm buffer. Doing that inline serialises CPU and GPU:
+    * the GPU is idle while the app records the next frame, and the CPU is
+    * blocked while the GPU drains. Instead we hand the frame off here and
+    * finish it at the start of the next present/acquire, by which point the
+    * fence is normally already signalled. */
+   bool defer_enabled;
+   bool defer_pending;
+   uint32_t defer_image_index;
+   uint64_t defer_present_id;
+   bool defer_has_damage;
+   VkPresentRegionKHR defer_damage;
+   VkRectLayerKHR defer_damage_rects[WSI_WL_MAX_DEFER_DAMAGE_RECTS];
 
    VkExtent2D extent;
    VkFormat vk_format;
@@ -2651,6 +2671,13 @@ wsi_wl_swapchain_wait_for_present(struct wsi_swapchain *wsi_chain,
 
    MESA_TRACE_FUNC();
 
+   /* The frame the caller is waiting for may still be sitting in the deferred
+    * slot, in which case it has not been committed yet and could never
+    * complete. Flush it before waiting. */
+   ret = wsi_wl_swapchain_flush_deferred(chain);
+   if (ret != VK_SUCCESS)
+      return ret;
+
    uint64_t atimeout;
    if (timeout == 0 || timeout == UINT64_MAX)
       atimeout = timeout;
@@ -2785,6 +2812,11 @@ wsi_wl_swapchain_wait_for_present2(struct wsi_swapchain *wsi_chain,
 
    MESA_TRACE_FUNC();
 
+   /* See wsi_wl_swapchain_wait_for_present(). */
+   ret = wsi_wl_swapchain_flush_deferred(chain);
+   if (ret != VK_SUCCESS)
+      return ret;
+
    uint64_t atimeout;
    if (timeout == 0 || timeout == UINT64_MAX)
       atimeout = timeout;
@@ -2830,6 +2862,10 @@ wsi_wl_swapchain_acquire_next_image_explicit(struct wsi_swapchain *wsi_chain,
    if (chain->retired)
       return VK_ERROR_OUT_OF_DATE_KHR;
 
+   VkResult defer_result = wsi_wl_swapchain_flush_deferred(chain);
+   if (defer_result != VK_SUCCESS)
+      return defer_result;
+
    STACK_ARRAY(struct wsi_image*, images, wsi_chain->image_count);
    for (uint32_t i = 0; i < chain->base.image_count; i++)
       images[i] = &chain->images[i].base;
@@ -2873,6 +2909,13 @@ wsi_wl_swapchain_acquire_next_image_implicit(struct wsi_swapchain *wsi_chain,
 
    struct wsi_wl_surface *wsi_wl_surface = chain->wsi_wl_surface;
    timespec_from_nsec(&rel_timeout, info->timeout);
+
+   /* A deferred frame still holds an image and has not been committed yet.
+    * Flush it before looking for a free image, otherwise we can spin here
+    * waiting for a release that can never arrive. */
+   VkResult defer_result = wsi_wl_swapchain_flush_deferred(chain);
+   if (defer_result != VK_SUCCESS)
+      return defer_result;
 
    clock_gettime(CLOCK_MONOTONIC, &start_time);
    timespec_add(&end_time, &rel_timeout, &start_time);
@@ -3154,14 +3197,25 @@ set_timestamp(struct wsi_wl_swapchain *chain,
 }
 
 static VkResult
-wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
-                               uint32_t image_index,
-                               uint64_t present_id,
-                               const VkPresentRegionKHR *damage)
+wsi_wl_swapchain_present_now(struct wsi_swapchain *wsi_chain,
+                             uint32_t image_index,
+                             uint64_t present_id,
+                             const VkPresentRegionKHR *damage)
 {
    struct wsi_wl_swapchain *chain = (struct wsi_wl_swapchain *)wsi_chain;
    bool timestamped = false;
    bool queue_dispatched = false;
+
+   /* The blit into cpu_map must have completed before we copy it out. This is
+    * skipped by wsi_common_queue_present() for deferred swapchains. */
+   if (chain->base.image_info.image_type == WSI_IMAGE_TYPE_CPU &&
+       chain->base.fences[image_index] != VK_NULL_HANDLE) {
+      VkResult r = chain->base.wsi->WaitForFences(chain->base.device, 1,
+                                                  &chain->base.fences[image_index],
+                                                  true, ~0ull);
+      if (r != VK_SUCCESS)
+         return r;
+   }
 
    MESA_TRACE_FUNC_FLOW(&chain->images[image_index].wayland_buffer.flow);
 
@@ -3393,6 +3447,69 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
    return VK_SUCCESS;
 }
 
+/* Complete a frame that was deferred by wsi_wl_swapchain_queue_present(). */
+static VkResult
+wsi_wl_swapchain_flush_deferred(struct wsi_wl_swapchain *chain)
+{
+   if (!chain->defer_pending)
+      return VK_SUCCESS;
+
+   chain->defer_pending = false;
+
+   /* If the swapchain retired while a frame was deferred, present_now() will
+    * bail out with OUT_OF_DATE and the image would stay busy forever. Release
+    * it here so acquire can still make progress. */
+   if (chain->retired) {
+      chain->images[chain->defer_image_index].busy = false;
+      return VK_SUCCESS;
+   }
+
+   return wsi_wl_swapchain_present_now(&chain->base, chain->defer_image_index,
+                                       chain->defer_present_id,
+                                       chain->defer_has_damage ?
+                                          &chain->defer_damage : NULL);
+}
+
+/* Defer the actual present by one frame so the GPU work submitted for this
+ * frame overlaps with the application recording the next one. Without this the
+ * CPU blocks on the render fence inside every vkQueuePresentKHR, which fully
+ * serialises CPU and GPU. */
+static VkResult
+wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
+                               uint32_t image_index,
+                               uint64_t present_id,
+                               const VkPresentRegionKHR *damage)
+{
+   struct wsi_wl_swapchain *chain = (struct wsi_wl_swapchain *)wsi_chain;
+   VkResult result;
+
+   if (!chain->defer_enabled)
+      return wsi_wl_swapchain_present_now(wsi_chain, image_index, present_id,
+                                          damage);
+
+   /* Flush the previous frame first, keeping presentation order. */
+   result = wsi_wl_swapchain_flush_deferred(chain);
+   if (result != VK_SUCCESS)
+      return result;
+
+   chain->defer_image_index = image_index;
+   chain->defer_present_id = present_id;
+   /* VkPresentRegionKHR points at caller memory that does not outlive this
+    * call, so copy the rectangles we need. */
+   chain->defer_has_damage = false;
+   if (damage && damage->pRectangles && damage->rectangleCount > 0 &&
+       damage->rectangleCount <= WSI_WL_MAX_DEFER_DAMAGE_RECTS) {
+      memcpy(chain->defer_damage_rects, damage->pRectangles,
+             damage->rectangleCount * sizeof(chain->defer_damage_rects[0]));
+      chain->defer_damage.pRectangles = chain->defer_damage_rects;
+      chain->defer_damage.rectangleCount = damage->rectangleCount;
+      chain->defer_has_damage = true;
+   }
+   chain->defer_pending = true;
+
+   return VK_SUCCESS;
+}
+
 static void
 buffer_handle_release(void *data, struct wl_buffer *buffer)
 {
@@ -3617,6 +3734,9 @@ wsi_wl_swapchain_destroy(struct wsi_swapchain *wsi_chain,
 {
    struct wsi_wl_swapchain *chain = (struct wsi_wl_swapchain *)wsi_chain;
 
+   /* Drop any deferred frame; its images are about to go away. */
+   chain->defer_pending = false;
+
    wsi_wl_swapchain_images_free(chain);
    wsi_wl_swapchain_chain_free(chain, pAllocator);
 
@@ -3832,6 +3952,15 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    chain->extent = pCreateInfo->imageExtent;
    chain->vk_format = pCreateInfo->imageFormat;
    chain->buffer_type = buffer_type;
+
+   /* Only the memcpy path benefits: it is the one that has to block on the
+    * render fence before touching cpu_map. Allow opting out at runtime for
+    * bisecting visual issues. */
+   chain->defer_enabled =
+      buffer_type == WSI_WL_BUFFER_SHM_MEMCPY &&
+      !debug_get_bool_option("WINFUSION_WSI_NO_DEFER", false);
+   chain->base.defer_present_fence_wait = chain->defer_enabled;
+
    if (buffer_type == WSI_WL_BUFFER_NATIVE) {
       chain->drm_format = wl_drm_format_for_vk_format(wsi_device,
                                                       chain->vk_format, alpha);

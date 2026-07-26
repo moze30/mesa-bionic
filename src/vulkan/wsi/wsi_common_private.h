@@ -297,6 +297,11 @@ struct wsi_swapchain {
       uint64_t minimum_complete_time;
    } present_timing;
 
+   /* Set by a WSI backend that defers the present (and therefore the wait on
+    * the render fence) until the next frame, so wsi_common_queue_present()
+    * must not block on that fence itself. */
+   bool defer_present_fence_wait;
+
    /* Command pools, one per queue family */
    VkCommandPool *cmd_pools;
 
