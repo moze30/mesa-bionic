@@ -2879,7 +2879,8 @@ wsi_common_queue_present(const struct wsi_device *wsi,
 #endif
       }
 
-      if (swapchain->image_info.image_type == WSI_IMAGE_TYPE_CPU) {
+      if (swapchain->image_info.image_type == WSI_IMAGE_TYPE_CPU &&
+          !swapchain->defer_present_fence_wait) {
          results[i] = wsi->WaitForFences(vk_device_to_handle(dev),
                                          1, &swapchain->fences[image_index],
                                          true, ~0ull);
@@ -3080,8 +3081,17 @@ wsi_select_host_memory_type(const struct wsi_device *wsi,
 {
    VkMemoryPropertyFlags req_props = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
-   if (wsi->sw)
-      req_props |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+   /* Request a cached memory type whenever the CPU is going to read this
+    * memory back. For a software device that is always the case, but a
+    * hardware driver presenting through a wl_shm/MIT-SHM style path also has
+    * to memcpy the image out of this allocation on every frame. Uncached
+    * write-combine memory is fine to write but pathologically slow to read,
+    * which makes that per-frame copy dominate the frame time.
+    *
+    * wsi_select_memory_type() already falls back to a plain coherent type if
+    * no cached type is available, so this is safe to ask for unconditionally.
+    */
+   req_props |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
 
    return wsi_select_memory_type(wsi, req_props, 0 /* deny_props */, type_bits);
 }
