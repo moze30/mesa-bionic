@@ -176,6 +176,7 @@ enum wsi_wl_buffer_type {
 };
 
 struct wsi_wl_swapchain;
+static VkResult wsi_wl_swapchain_flush_deferred_one(struct wsi_wl_swapchain *chain);
 static VkResult wsi_wl_swapchain_flush_deferred(struct wsi_wl_swapchain *chain);
 
 struct wsi_wl_surface {
@@ -193,6 +194,17 @@ struct wsi_wl_surface {
 };
 
 #define WSI_WL_MAX_DEFER_DAMAGE_RECTS 16
+#define WSI_WL_MAX_DEFER_DEPTH 3
+
+struct wsi_wl_deferred_present {
+   uint32_t image_index;
+   uint64_t present_id;
+   VkPresentModeKHR present_mode;
+   struct wsi_image_timing_request timing_request;
+   bool has_damage;
+   VkPresentRegionKHR damage;
+   VkRectLayerKHR damage_rects[WSI_WL_MAX_DEFER_DAMAGE_RECTS];
+};
 
 struct wsi_wl_swapchain {
    struct wsi_swapchain base;
@@ -207,18 +219,13 @@ struct wsi_wl_swapchain {
 
    /* Deferred present state. For the wl_shm path the CPU must wait for the
     * app's rendering (and our blit) to land in host memory before it can copy
-    * the image into the shm buffer. Doing that inline serialises CPU and GPU:
-    * the GPU is idle while the app records the next frame, and the CPU is
-    * blocked while the GPU drains. Instead we hand the frame off here and
-    * finish it at the start of the next present/acquire, by which point the
-    * fence is normally already signalled. */
+    * the image into the shm buffer. Keeping a small queue lets the application
+    * prepare later frames before older render fences are consumed. */
    bool defer_enabled;
-   bool defer_pending;
-   uint32_t defer_image_index;
-   uint64_t defer_present_id;
-   bool defer_has_damage;
-   VkPresentRegionKHR defer_damage;
-   VkRectLayerKHR defer_damage_rects[WSI_WL_MAX_DEFER_DAMAGE_RECTS];
+   uint32_t defer_depth;
+   uint32_t defer_head;
+   uint32_t defer_count;
+   struct wsi_wl_deferred_present deferred[WSI_WL_MAX_DEFER_DEPTH];
 
    VkExtent2D extent;
    VkFormat vk_format;
@@ -1771,7 +1778,7 @@ wsi_wl_surface_get_support(VkIcdSurfaceBase *surface,
  * An application rendering much faster than the compositor repaints therefore
  * runs out of images and blocks in AcquireNextImage. Keep a deeper pool so
  * there is normally always one free. */
-#define WSI_WL_SHM_NUM_IMAGES 12
+#define WSI_WL_SHM_NUM_IMAGES 16
 
 /* Catch-all. 3 images is a sound default for everything except MAILBOX. */
 #define WSI_WL_DEFAULT_NUM_IMAGES 3
@@ -2943,8 +2950,8 @@ wsi_wl_swapchain_acquire_next_image_implicit(struct wsi_swapchain *wsi_chain,
          }
       }
 
-      if (!defer_flushed && chain->defer_pending) {
-         VkResult defer_result = wsi_wl_swapchain_flush_deferred(chain);
+      if (!defer_flushed && chain->defer_count) {
+         VkResult defer_result = wsi_wl_swapchain_flush_deferred_one(chain);
          if (defer_result != VK_SUCCESS)
             return defer_result;
          defer_flushed = true;
@@ -3459,31 +3466,44 @@ wsi_wl_swapchain_present_now(struct wsi_swapchain *wsi_chain,
 
 /* Complete a frame that was deferred by wsi_wl_swapchain_queue_present(). */
 static VkResult
-wsi_wl_swapchain_flush_deferred(struct wsi_wl_swapchain *chain)
+wsi_wl_swapchain_flush_deferred_one(struct wsi_wl_swapchain *chain)
 {
-   if (!chain->defer_pending)
+   if (!chain->defer_count)
       return VK_SUCCESS;
 
-   chain->defer_pending = false;
+   struct wsi_wl_deferred_present *deferred =
+      &chain->deferred[chain->defer_head];
 
-   /* If the swapchain retired while a frame was deferred, present_now() will
-    * bail out with OUT_OF_DATE and the image would stay busy forever. Release
-    * it here so acquire can still make progress. */
    if (chain->retired) {
-      chain->images[chain->defer_image_index].busy = false;
-      return VK_SUCCESS;
+      chain->images[deferred->image_index].busy = false;
+   } else {
+      chain->base.present_mode = deferred->present_mode;
+      chain->timing_request = deferred->timing_request;
+      VkResult result = wsi_wl_swapchain_present_now(
+         &chain->base, deferred->image_index, deferred->present_id,
+         deferred->has_damage ? &deferred->damage : NULL);
+      if (result != VK_SUCCESS)
+         return result;
    }
 
-   return wsi_wl_swapchain_present_now(&chain->base, chain->defer_image_index,
-                                       chain->defer_present_id,
-                                       chain->defer_has_damage ?
-                                          &chain->defer_damage : NULL);
+   chain->defer_head = (chain->defer_head + 1) % WSI_WL_MAX_DEFER_DEPTH;
+   chain->defer_count--;
+   return VK_SUCCESS;
 }
 
-/* Defer the actual present by one frame so the GPU work submitted for this
- * frame overlaps with the application recording the next one. Without this the
- * CPU blocks on the render fence inside every vkQueuePresentKHR, which fully
- * serialises CPU and GPU. */
+static VkResult
+wsi_wl_swapchain_flush_deferred(struct wsi_wl_swapchain *chain)
+{
+   while (chain->defer_count) {
+      VkResult result = wsi_wl_swapchain_flush_deferred_one(chain);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   return VK_SUCCESS;
+}
+
+/* Keep several IMMEDIATE presents pending so CPU frame preparation can overlap
+ * the render and readback work for older frames. */
 static VkResult
 wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
                                uint32_t image_index,
@@ -3497,25 +3517,57 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
       return wsi_wl_swapchain_present_now(wsi_chain, image_index, present_id,
                                           damage);
 
-   /* Flush the previous frame first, keeping presentation order. */
-   result = wsi_wl_swapchain_flush_deferred(chain);
-   if (result != VK_SUCCESS)
-      return result;
+   VkPresentModeKHR present_mode = chain->base.present_mode;
+   struct wsi_image_timing_request timing_request = chain->timing_request;
+   memset(&chain->timing_request, 0, sizeof(chain->timing_request));
 
-   chain->defer_image_index = image_index;
-   chain->defer_present_id = present_id;
-   /* VkPresentRegionKHR points at caller memory that does not outlive this
-    * call, so copy the rectangles we need. */
-   chain->defer_has_damage = false;
+   bool allow_deep_defer =
+      present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR &&
+      present_id == 0 && !timing_request.serial;
+   if (allow_deep_defer) {
+      for (uint32_t i = 0; i < chain->defer_count; i++) {
+         uint32_t index =
+            (chain->defer_head + i) % WSI_WL_MAX_DEFER_DEPTH;
+         struct wsi_wl_deferred_present *queued = &chain->deferred[index];
+         if (queued->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR ||
+             queued->present_id != 0 || queued->timing_request.serial) {
+            allow_deep_defer = false;
+            break;
+         }
+      }
+   }
+
+   uint32_t defer_depth = allow_deep_defer ? chain->defer_depth : 1;
+   while (chain->defer_count >= defer_depth) {
+      result = wsi_wl_swapchain_flush_deferred_one(chain);
+      if (result != VK_SUCCESS) {
+         chain->images[image_index].busy = false;
+         chain->base.present_mode = present_mode;
+         memset(&chain->timing_request, 0, sizeof(chain->timing_request));
+         return result;
+      }
+      chain->base.present_mode = present_mode;
+      chain->timing_request = timing_request;
+   }
+
+   uint32_t defer_tail =
+      (chain->defer_head + chain->defer_count) % WSI_WL_MAX_DEFER_DEPTH;
+   struct wsi_wl_deferred_present *deferred = &chain->deferred[defer_tail];
+   deferred->image_index = image_index;
+   deferred->present_id = present_id;
+   deferred->present_mode = present_mode;
+   deferred->timing_request = timing_request;
+   deferred->has_damage = false;
    if (damage && damage->pRectangles && damage->rectangleCount > 0 &&
        damage->rectangleCount <= WSI_WL_MAX_DEFER_DAMAGE_RECTS) {
-      memcpy(chain->defer_damage_rects, damage->pRectangles,
-             damage->rectangleCount * sizeof(chain->defer_damage_rects[0]));
-      chain->defer_damage.pRectangles = chain->defer_damage_rects;
-      chain->defer_damage.rectangleCount = damage->rectangleCount;
-      chain->defer_has_damage = true;
+      memcpy(deferred->damage_rects, damage->pRectangles,
+             damage->rectangleCount * sizeof(deferred->damage_rects[0]));
+      deferred->damage.pRectangles = deferred->damage_rects;
+      deferred->damage.rectangleCount = damage->rectangleCount;
+      deferred->has_damage = true;
    }
-   chain->defer_pending = true;
+   chain->defer_count++;
+   memset(&chain->timing_request, 0, sizeof(chain->timing_request));
 
    return VK_SUCCESS;
 }
@@ -3744,8 +3796,8 @@ wsi_wl_swapchain_destroy(struct wsi_swapchain *wsi_chain,
 {
    struct wsi_wl_swapchain *chain = (struct wsi_wl_swapchain *)wsi_chain;
 
-   /* Drop any deferred frame; its images are about to go away. */
-   chain->defer_pending = false;
+   /* Drop deferred frames; their images are about to go away. */
+   chain->defer_count = 0;
 
    wsi_wl_swapchain_images_free(chain);
    wsi_wl_swapchain_chain_free(chain, pAllocator);
@@ -3789,10 +3841,12 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
     * oldSwapchain is retired - even if creation of the new swapchain fails. */
    if (pCreateInfo->oldSwapchain) {
       VK_FROM_HANDLE(wsi_wl_swapchain, old_chain, pCreateInfo->oldSwapchain);
-      /* oldSwapchain is extern-sync, so it is not possible to call AcquireNextImage or QueuePresent
-       * concurrently with this function. Next call to acquire or present will immediately
-       * return OUT_OF_DATE. */
+      /* oldSwapchain is externally synchronized, so pending presents can be
+       * drained before retiring it. */
+      result = wsi_wl_swapchain_flush_deferred(old_chain);
       old_chain->retired = true;
+      if (result != VK_SUCCESS)
+         return result;
    }
 
    /* We need to allocate the chain handle early, since display initialization code relies on it.
@@ -3980,6 +4034,9 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       buffer_type == WSI_WL_BUFFER_SHM_MEMCPY &&
       !debug_get_bool_option("WINFUSION_WSI_NO_DEFER", false);
    chain->base.defer_present_fence_wait = chain->defer_enabled;
+   chain->defer_depth = CLAMP(
+      debug_get_num_option("WINFUSION_WSI_DEFER_DEPTH", 3),
+      1, WSI_WL_MAX_DEFER_DEPTH);
 
    if (buffer_type == WSI_WL_BUFFER_NATIVE) {
       chain->drm_format = wl_drm_format_for_vk_format(wsi_device,
