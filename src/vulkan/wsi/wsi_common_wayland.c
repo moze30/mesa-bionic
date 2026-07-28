@@ -1771,7 +1771,7 @@ wsi_wl_surface_get_support(VkIcdSurfaceBase *surface,
  * An application rendering much faster than the compositor repaints therefore
  * runs out of images and blocks in AcquireNextImage. Keep a deeper pool so
  * there is normally always one free. */
-#define WSI_WL_SHM_NUM_IMAGES 6
+#define WSI_WL_SHM_NUM_IMAGES 12
 
 /* Catch-all. 3 images is a sound default for everything except MAILBOX. */
 #define WSI_WL_DEFAULT_NUM_IMAGES 3
@@ -2917,15 +2917,10 @@ wsi_wl_swapchain_acquire_next_image_implicit(struct wsi_swapchain *wsi_chain,
    struct wsi_wl_surface *wsi_wl_surface = chain->wsi_wl_surface;
    timespec_from_nsec(&rel_timeout, info->timeout);
 
-   /* A deferred frame still holds an image and has not been committed yet.
-    * Flush it before looking for a free image, otherwise we can spin here
-    * waiting for a release that can never arrive. */
-   VkResult defer_result = wsi_wl_swapchain_flush_deferred(chain);
-   if (defer_result != VK_SUCCESS)
-      return defer_result;
-
    clock_gettime(CLOCK_MONOTONIC, &start_time);
    timespec_add(&end_time, &rel_timeout, &start_time);
+
+   bool defer_flushed = false;
 
    while (1) {
       /* If we can use timestamps, we want to make sure the queue feedback
@@ -2946,6 +2941,14 @@ wsi_wl_swapchain_acquire_next_image_implicit(struct wsi_swapchain *wsi_chain,
             loader_wayland_buffer_set_flow(&chain->images[i].wayland_buffer, &flow);
             return (chain->suboptimal ? VK_SUBOPTIMAL_KHR : VK_SUCCESS);
          }
+      }
+
+      if (!defer_flushed && chain->defer_pending) {
+         VkResult defer_result = wsi_wl_swapchain_flush_deferred(chain);
+         if (defer_result != VK_SUCCESS)
+            return defer_result;
+         defer_flushed = true;
+         continue;
       }
 
       /* Try to dispatch potential events. */
