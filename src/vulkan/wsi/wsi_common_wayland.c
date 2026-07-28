@@ -1778,7 +1778,7 @@ wsi_wl_surface_get_support(VkIcdSurfaceBase *surface,
  * An application rendering much faster than the compositor repaints therefore
  * runs out of images and blocks in AcquireNextImage. Keep a deeper pool so
  * there is normally always one free. */
-#define WSI_WL_SHM_NUM_IMAGES 16
+#define WSI_WL_SHM_NUM_IMAGES 32
 
 /* Catch-all. 3 images is a sound default for everything except MAILBOX. */
 #define WSI_WL_DEFAULT_NUM_IMAGES 3
