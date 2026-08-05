@@ -4032,6 +4032,7 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
     * bisecting visual issues. */
    chain->defer_enabled =
       buffer_type == WSI_WL_BUFFER_SHM_MEMCPY &&
+      !uses_present_mode_group &&
       !debug_get_bool_option("WINFUSION_WSI_NO_DEFER", false);
    chain->base.defer_present_fence_wait = chain->defer_enabled;
    chain->defer_depth = CLAMP(
