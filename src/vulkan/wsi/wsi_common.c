@@ -179,6 +179,10 @@ wsi_device_init(struct wsi_device *wsi,
       supported_extensions->KHR_timeline_semaphore;
    wsi->has_host_query_reset =
       supported_extensions->EXT_host_query_reset;
+#if defined(VK_USE_PLATFORM_ANDROID_KHR) && ANDROID_API_LEVEL >= 26
+   wsi->has_android_hardware_buffer =
+      supported_extensions->ANDROID_external_memory_android_hardware_buffer;
+#endif
 
    /* We cannot expose KHR_present_wait without timeline semaphores. */
    assert(!wsi->has_present_wait || wsi->has_timeline_semaphore);
@@ -220,6 +224,10 @@ wsi_device_init(struct wsi_device *wsi,
    WSI_GET_CB(GetImageSubresourceLayout);
    if (!wsi->sw)
       WSI_GET_CB(GetMemoryFdKHR);
+#if defined(VK_USE_PLATFORM_ANDROID_KHR) && ANDROID_API_LEVEL >= 26
+   if (wsi->has_android_hardware_buffer)
+      WSI_GET_CB(GetMemoryAndroidHardwareBufferANDROID);
+#endif
    WSI_GET_CB(GetPhysicalDeviceCalibrateableTimeDomainsKHR);
    WSI_GET_CB(GetPhysicalDeviceProperties);
    WSI_GET_CB(GetPhysicalDeviceFormatProperties);
@@ -416,6 +424,8 @@ get_blit_type(const struct wsi_device *wsi,
          WSI_SWAPCHAIN_BUFFER_BLIT : WSI_SWAPCHAIN_NO_BLIT;
    }
 #endif
+   case WSI_IMAGE_TYPE_AHB:
+      return WSI_SWAPCHAIN_NO_BLIT;
 #ifdef _WIN32
    case WSI_IMAGE_TYPE_DXGI: {
       const struct wsi_dxgi_image_params *dxgi_params =
@@ -465,6 +475,24 @@ configure_image(const struct wsi_swapchain *chain,
       return wsi_drm_configure_image(chain, pCreateInfo, drm_params, info);
    }
 #endif
+   case WSI_IMAGE_TYPE_AHB: {
+      const struct wsi_ahb_image_params *ahb_params =
+         container_of(params, const struct wsi_ahb_image_params, base);
+      VkResult result = wsi_configure_image(
+         chain, pCreateInfo,
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
+         info);
+      if (result != VK_SUCCESS)
+         return result;
+
+      info->image_type = WSI_IMAGE_TYPE_AHB;
+      info->explicit_sync = ahb_params->explicit_sync;
+      info->wsi.scanout = true;
+      info->create.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+      info->usage2.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+      info->create_mem = ahb_params->create_mem;
+      return VK_SUCCESS;
+   }
 #ifdef _WIN32
    case WSI_IMAGE_TYPE_DXGI: {
       const struct wsi_dxgi_image_params *dxgi_params =
@@ -573,9 +601,12 @@ wsi_swapchain_init(const struct wsi_device *wsi,
       goto fail;
 
 #ifdef HAVE_LIBDRM
-   result = wsi_drm_init_swapchain_implicit_sync(chain);
-   if (result != VK_SUCCESS)
-      goto fail;
+   if (chain->image_info.image_type == WSI_IMAGE_TYPE_DRM ||
+       chain->image_info.image_type == WSI_IMAGE_TYPE_AHB) {
+      result = wsi_drm_init_swapchain_implicit_sync(chain);
+      if (result != VK_SUCCESS)
+         goto fail;
+   }
 #endif
 
    if ((pCreateInfo->flags & VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT) ||
@@ -1512,14 +1543,12 @@ wsi_CreateSwapchainKHR(VkDevice _device,
       swapchain->present_timing.active = true;
       mtx_init(&swapchain->present_timing.lock, 0);
 
-      if (swapchain->present_timing.supported_query_stages & VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT) {
-         for (uint32_t i = 0; i < swapchain->image_count; i++) {
-            struct wsi_image *image = swapchain->get_wsi_image(swapchain, i);
-            result = wsi_image_init_timestamp(swapchain, image);
-            if (result != VK_SUCCESS) {
-               swapchain->destroy(swapchain, alloc);
-               return result;
-            }
+      for (uint32_t i = 0; i < swapchain->image_count; i++) {
+         struct wsi_image *image = swapchain->get_wsi_image(swapchain, i);
+         result = wsi_image_init_timestamp(swapchain, image);
+         if (result != VK_SUCCESS) {
+            swapchain->destroy(swapchain, alloc);
+            return result;
          }
       }
 
@@ -1767,7 +1796,7 @@ static VkResult wsi_common_allocate_timing_request(
 
    /* Allows timestamp queries to fail if GPU is not done with current submission.
     * Resetting on queue will not work. */
-   if (swapchain->wsi->has_host_query_reset && image->query_pool)
+   if (swapchain->wsi->has_host_query_reset)
       swapchain->wsi->ResetQueryPoolEXT(swapchain->device, image->query_pool, 0, 1);
 
    /* Ignore the time domain since we have a static domain. */
@@ -2868,7 +2897,8 @@ wsi_common_queue_present(const struct wsi_device *wsi,
        * attach it to the dma-buf before we present so that the present
        * implicitly syncs on it.
        */
-      if (swapchain->dma_buf_semaphore != VK_NULL_HANDLE) {
+      if (swapchain->dma_buf_semaphore != VK_NULL_HANDLE &&
+          !swapchain->semaphore_as_acquire_fence) {
 #ifdef HAVE_LIBDRM
          assert(!swapchain->image_info.explicit_sync);
          results[i] = wsi_signal_dma_buf_from_semaphore(swapchain, image);
@@ -2879,9 +2909,13 @@ wsi_common_queue_present(const struct wsi_device *wsi,
 #endif
       }
 
-      if (wsi->sw) {
-         wsi->WaitForFences(vk_device_to_handle(dev),
-                            1, &swapchain->fences[image_index], true, ~0ull);
+      if (swapchain->image_info.image_type == WSI_IMAGE_TYPE_CPU &&
+          !swapchain->defer_present_fence_wait) {
+         results[i] = wsi->WaitForFences(vk_device_to_handle(dev),
+                                         1, &swapchain->fences[image_index],
+                                         true, ~0ull);
+         if (results[i] != VK_SUCCESS)
+            continue;
       }
 
       const VkPresentRegionKHR *region = NULL;
@@ -3077,8 +3111,17 @@ wsi_select_host_memory_type(const struct wsi_device *wsi,
 {
    VkMemoryPropertyFlags req_props = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
-   if (wsi->sw)
-      req_props |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+   /* Request a cached memory type whenever the CPU is going to read this
+    * memory back. For a software device that is always the case, but a
+    * hardware driver presenting through a wl_shm/MIT-SHM style path also has
+    * to memcpy the image out of this allocation on every frame. Uncached
+    * write-combine memory is fine to write but pathologically slow to read,
+    * which makes that per-frame copy dominate the frame time.
+    *
+    * wsi_select_memory_type() already falls back to a plain coherent type if
+    * no cached type is available, so this is safe to ask for unconditionally.
+    */
+   req_props |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
 
    return wsi_select_memory_type(wsi, req_props, 0 /* deny_props */, type_bits);
 }
@@ -3678,11 +3721,9 @@ wsi_device_supports_explicit_sync(struct wsi_device *device)
 }
 
 /**
- * Returns true if at least one enabled WSI surface extension supports
+ * Returns true if an enabled WSI surface extension supports
  * VK_GOOGLE_display_timing, and none of the enabled surfaces *don't* support it
- * (since the device extension lacks per-surface feature flags).
- * Also returns true for mixed supported + (maybe) unsupported cases if user
- * opts in via dri config option vk_google_display_timing = true
+ * (since the device extension lacks per-surface feature flags)
  */
 bool
 wsi_instance_supports_google_display_timing(const struct vk_instance *instance,

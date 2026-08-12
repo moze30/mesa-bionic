@@ -31,14 +31,18 @@
 #include <string.h>
 #include <poll.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/socket.h>
 
 #include "drm-uapi/drm_fourcc.h"
 
 #include "vk_instance.h"
+#include "vk_format.h"
 #include "vk_device.h"
 #include "vk_physical_device.h"
 #include "vk_util.h"
+#include "vk_android.h"
 #include "wsi_common_entrypoints.h"
 #include "wsi_common_private.h"
 #include "fifo-v1-client-protocol.h"
@@ -46,8 +50,10 @@
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "presentation-time-client-protocol.h"
 #include "linux-drm-syncobj-v1-client-protocol.h"
+#include "linux-explicit-synchronization-unstable-v1-client-protocol.h"
 #include "tearing-control-v1-client-protocol.h"
 #include "color-management-v1-client-protocol.h"
+#include "winfusion-protocol/winfusion-buffer-v1-client-protocol.h"
 
 #include <util/cnd_monotonic.h>
 #include <util/compiler.h>
@@ -58,8 +64,18 @@
 #include <util/u_dynarray.h>
 #include <util/anon_file.h>
 #include <util/os_time.h>
+#include <util/os_file.h>
 
 #include <loader/loader_wayland_helper.h>
+
+#if defined(VK_USE_PLATFORM_ANDROID_KHR) && ANDROID_API_LEVEL >= 26
+#include <android/hardware_buffer.h>
+#include <vndk/hardware_buffer.h>
+#define WSI_WL_HAS_AHB 1
+#else
+#define WSI_WL_HAS_AHB 0
+struct AHardwareBuffer;
+#endif
 
 #ifdef MAJOR_IN_MKDEV
 #include <sys/mkdev.h>
@@ -107,10 +123,13 @@ struct wsi_wl_display {
    struct wl_fixes *wl_fixes;
 
    struct wl_shm *wl_shm;
+   uint32_t wl_shm_name;
    struct zwp_linux_dmabuf_v1 *wl_dmabuf;
+   struct zwp_winfusion_buffer_v1 *winfusion_buffer;
    struct zwp_linux_dmabuf_feedback_v1 *wl_dmabuf_feedback;
    struct wp_tearing_control_manager_v1 *tearing_control_manager;
    struct wp_linux_drm_syncobj_manager_v1 *wl_syncobj;
+   struct zwp_linux_explicit_synchronization_v1 *wl_explicit_sync;
 
    struct wp_color_manager_v1 *color_manager;
 
@@ -165,6 +184,11 @@ struct wsi_wl_image {
    void *shm_ptr;
    unsigned shm_size;
 
+   struct AHardwareBuffer *winfusion_ahb;
+   uint32_t winfusion_stride;
+   uint64_t winfusion_size;
+   uint64_t winfusion_modifier;
+
    struct wp_linux_drm_syncobj_timeline_v1 *wl_syncobj_timeline[WSI_ES_COUNT];
 };
 
@@ -172,7 +196,12 @@ enum wsi_wl_buffer_type {
    WSI_WL_BUFFER_NATIVE,
    WSI_WL_BUFFER_GPU_SHM,
    WSI_WL_BUFFER_SHM_MEMCPY,
+   WSI_WL_BUFFER_AHB,
 };
+
+struct wsi_wl_swapchain;
+static VkResult wsi_wl_swapchain_flush_deferred_one(struct wsi_wl_swapchain *chain);
+static VkResult wsi_wl_swapchain_flush_deferred(struct wsi_wl_swapchain *chain);
 
 struct wsi_wl_surface {
    VkIcdSurfaceWayland base;
@@ -188,6 +217,19 @@ struct wsi_wl_surface {
    struct vk_instance *instance;
 };
 
+#define WSI_WL_MAX_DEFER_DAMAGE_RECTS 16
+#define WSI_WL_MAX_DEFER_DEPTH 3
+
+struct wsi_wl_deferred_present {
+   uint32_t image_index;
+   uint64_t present_id;
+   VkPresentModeKHR present_mode;
+   struct wsi_image_timing_request timing_request;
+   bool has_damage;
+   VkPresentRegionKHR damage;
+   VkRectLayerKHR damage_rects[WSI_WL_MAX_DEFER_DAMAGE_RECTS];
+};
+
 struct wsi_wl_swapchain {
    struct wsi_swapchain base;
 
@@ -196,8 +238,23 @@ struct wsi_wl_swapchain {
    struct wp_fifo_v1 *fifo;
    struct wp_commit_timer_v1 *commit_timer;
    struct wp_linux_drm_syncobj_surface_v1 *wl_syncobj_surface;
+   /* Acquire-fence explicit sync used when dma-buf implicit sync is
+    * unavailable (Android KGSL). */
+   struct zwp_linux_surface_synchronization_v1 *wl_surface_sync;
 
    struct wl_callback *frame;
+   /* Completion barrier for asynchronous AHB import requests. */
+   struct wl_callback *ahb_import_callback;
+
+   /* Deferred present state. For the wl_shm path the CPU must wait for the
+    * app's rendering (and our blit) to land in host memory before it can copy
+    * the image into the shm buffer. Keeping a small queue lets the application
+    * prepare later frames before older render fences are consumed. */
+   bool defer_enabled;
+   uint32_t defer_depth;
+   uint32_t defer_head;
+   uint32_t defer_count;
+   struct wsi_wl_deferred_present deferred[WSI_WL_MAX_DEFER_DEPTH];
 
    VkExtent2D extent;
    VkFormat vk_format;
@@ -278,78 +335,6 @@ find_format(struct u_vector *formats, VkFormat format)
          return f;
 
    return NULL;
-}
-
-static VkTimeDomainKHR
-clock_id_to_vk_time_domain(clockid_t id)
-{
-   switch (id) {
-      case CLOCK_MONOTONIC:
-         return VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
-      case CLOCK_MONOTONIC_RAW:
-         return VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR;
-      default:
-         /* Default fallback. Will likely not be used, but is safe to use. */
-         return VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
-   }
-}
-
-static clockid_t
-vk_time_domain_to_clock_id(VkTimeDomainKHR id)
-{
-   switch (id) {
-      case VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR:
-         return CLOCK_MONOTONIC;
-      case VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR:
-         return CLOCK_MONOTONIC_RAW;
-      default:
-         /* Default fallback. Will not be used. */
-         return 0;
-   }
-}
-
-static uint64_t
-wsi_wl_convert_wayland_to_swapchain_time(struct wsi_wl_swapchain *chain,
-                                         uint64_t in_timestamp,
-                                         bool chain_to_wayland)
-{
-   struct timespec src_ts, src_ts2;
-   struct timespec dst_ts;
-   uint64_t timestamps[2];
-   bool fail;
-
-   clockid_t src = chain->wsi_wl_surface->display->presentation_clock_id;
-   clockid_t dst = vk_time_domain_to_clock_id(chain->base.present_timing.time_domain);
-
-   if (chain_to_wayland) {
-      src = dst;
-      dst = chain->wsi_wl_surface->display->presentation_clock_id;
-   }
-
-   /* Common case, most compositors: Nothing to do if both time domains match. */
-   if (src == dst)
-      return in_timestamp;
-
-   /* Get reference time of src and dst time domain, with max 10 usecs error. */
-   do {
-      fail = clock_gettime(src, &src_ts);
-      fail |= clock_gettime(dst, &dst_ts);
-      fail |= clock_gettime(src, &src_ts2);
-   } while (!fail && (timespec_sub_to_nsec(&src_ts2, &src_ts) > 10 * 1000ULL));
-
-   /* fail should not happen in practice, unless there's a Wayland server bug. */
-   assert(!fail);
-   if (fail) {
-      return 0;
-   }
-
-   timestamps[0] = timespec_to_nsec(&src_ts);
-   timestamps[1] = timespec_to_nsec(&dst_ts);
-
-   /* Remap */
-   int64_t delta_ns = (int64_t)in_timestamp - (int64_t)timestamps[0];
-   uint64_t target_timestamp = timestamps[1] + delta_ns;
-   return target_timestamp;
 }
 
 /* Given a time base and a refresh period, find the next
@@ -1475,37 +1460,42 @@ static const struct wp_presentation_listener presentation_listener = {
    presentation_handle_clock_id,
 };
 
-#if defined(WL_FIXES_ACK_GLOBAL_REMOVE)
-#define MESA_WL_FIXES_VERSION 2
-#elif defined(WL_FIXES_INTERFACE)
-#define MESA_WL_FIXES_VERSION 1
-#endif
-
 static void
 registry_handle_global(void *data, struct wl_registry *registry,
                        uint32_t name, const char *interface, uint32_t version)
 {
    struct wsi_wl_display *display = data;
 
-   if (display->sw) {
-      if (strcmp(interface, wl_shm_interface.name) == 0) {
+   if (strcmp(interface, wl_shm_interface.name) == 0) {
+      if (display->sw) {
          display->wl_shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
          wl_shm_add_listener(display->wl_shm, &shm_listener, display);
+      } else {
+         display->wl_shm_name = name;
       }
-   } else {
+   }
+
+   if (!display->sw) {
       if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0 && version >= 3) {
          display->wl_dmabuf =
             wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface,
                              MIN2(version, ZWP_LINUX_DMABUF_V1_GET_DEFAULT_FEEDBACK_SINCE_VERSION));
          zwp_linux_dmabuf_v1_add_listener(display->wl_dmabuf,
                                           &dmabuf_listener, display);
+      } else if (strcmp(interface, zwp_winfusion_buffer_v1_interface.name) == 0) {
+         display->winfusion_buffer =
+            wl_registry_bind(registry, name, &zwp_winfusion_buffer_v1_interface,
+                             MIN2(version, 1));
       } else if (strcmp(interface, wp_linux_drm_syncobj_manager_v1_interface.name) == 0) {
          display->wl_syncobj =
             wl_registry_bind(registry, name, &wp_linux_drm_syncobj_manager_v1_interface, 1);
-#ifdef MESA_WL_FIXES_VERSION
+      } else if (strcmp(interface, zwp_linux_explicit_synchronization_v1_interface.name) == 0) {
+         display->wl_explicit_sync =
+            wl_registry_bind(registry, name, &zwp_linux_explicit_synchronization_v1_interface, 1);
+#ifdef WL_FIXES_INTERFACE
       } else if (strcmp(interface, wl_fixes_interface.name) == 0) {
          display->wl_fixes =
-            wl_registry_bind(registry, name, &wl_fixes_interface, MIN2(version, MESA_WL_FIXES_VERSION));
+            wl_registry_bind(registry, name, &wl_fixes_interface, 1);
 #endif
       }
    }
@@ -1547,15 +1537,7 @@ registry_handle_global(void *data, struct wl_registry *registry,
 static void
 registry_handle_global_remove(void *data, struct wl_registry *registry,
                               uint32_t name)
-{
-#ifdef WL_FIXES_ACK_GLOBAL_REMOVE
-   struct wsi_wl_display *display = data;
-
-   if (display->wl_fixes && wl_fixes_get_version(display->wl_fixes) >= WL_FIXES_ACK_GLOBAL_REMOVE_SINCE_VERSION) {
-      wl_fixes_ack_global_remove(display->wl_fixes, registry, name);
-   }
-#endif
-}
+{ /* No-op */ }
 
 static const struct wl_registry_listener registry_listener = {
    registry_handle_global,
@@ -1581,8 +1563,12 @@ wsi_wl_display_finish(struct wsi_wl_display *display)
       wl_shm_destroy(display->wl_shm);
    if (display->wl_syncobj)
       wp_linux_drm_syncobj_manager_v1_destroy(display->wl_syncobj);
+   if (display->wl_explicit_sync)
+      zwp_linux_explicit_synchronization_v1_destroy(display->wl_explicit_sync);
    if (display->wl_dmabuf)
       zwp_linux_dmabuf_v1_destroy(display->wl_dmabuf);
+   if (display->winfusion_buffer)
+      zwp_winfusion_buffer_v1_destroy(display->winfusion_buffer);
    if (display->wp_presentation_notwrapped)
       wp_presentation_destroy(display->wp_presentation_notwrapped);
    if (display->fifo_manager)
@@ -1645,6 +1631,16 @@ wsi_wl_display_init(struct wsi_wayland *wsi_wl,
 
    /* Round-trip to get wl_shm and zwp_linux_dmabuf_v1 globals */
    wl_display_roundtrip_queue(display->wl_display, display->queue);
+   if (!display->wl_dmabuf && !display->wl_shm && display->wl_shm_name) {
+      display->wl_shm = wl_registry_bind(registry, display->wl_shm_name,
+                                         &wl_shm_interface, 1);
+      if (!display->wl_shm) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto fail_registry;
+      }
+      wl_shm_add_listener(display->wl_shm, &shm_listener, display);
+   }
+
    if (!display->wl_dmabuf && !display->wl_shm) {
       result = VK_ERROR_SURFACE_LOST_KHR;
       goto fail_registry;
@@ -1817,8 +1813,25 @@ wsi_wl_surface_get_support(VkIcdSurfaceBase *surface,
  */
 #define WSI_WL_BUMPED_NUM_IMAGES 4
 
+/* The wl_shm path hands a buffer to the compositor and cannot reuse it until
+ * the compositor sends wl_buffer.release, which only happens once per repaint.
+ * An application rendering much faster than the compositor repaints therefore
+ * runs out of images and blocks in AcquireNextImage. Keep a deeper pool so
+ * there is normally always one free. */
+#define WSI_WL_SHM_NUM_IMAGES 32
+
 /* Catch-all. 3 images is a sound default for everything except MAILBOX. */
 #define WSI_WL_DEFAULT_NUM_IMAGES 3
+
+/* The private AHB path hands the compositor an image and cannot reuse it until
+ * that frame has been released, and the compositor only processes releases on
+ * its repaint tick. An application rendering far faster than the compositor
+ * therefore drains the pool and blocks in AcquireNextImage for most of a
+ * refresh interval. A deeper pool lets several frames be in flight between
+ * ticks, which lifts the achievable frame rate roughly proportionally to the
+ * pool size. WINFUSION_WSI_AHB_IMAGES overrides the default for tuning. */
+#define WSI_WL_AHB_NUM_IMAGES_DEFAULT 16
+#define WSI_WL_AHB_NUM_IMAGES_MAX 32
 
 static uint32_t
 wsi_wl_surface_get_min_image_count(struct wsi_wl_display *display,
@@ -2619,12 +2632,6 @@ wsi_wl_swapchain_set_timing_request(struct wsi_swapchain *wsi_chain,
 {
    struct wsi_wl_swapchain *chain = (struct wsi_wl_swapchain *)wsi_chain;
    chain->timing_request = *request;
-
-   /* Convert absolute target time from swapchain time domain to whatever Wayland natively expects. */
-   if (!(chain->timing_request.flags & VK_PRESENT_TIMING_INFO_PRESENT_AT_RELATIVE_TIME_BIT_EXT)) {
-      chain->timing_request.time =
-         wsi_wl_convert_wayland_to_swapchain_time(chain, chain->timing_request.time, true);
-   }
 }
 
 static VkResult
@@ -2727,6 +2734,13 @@ wsi_wl_swapchain_wait_for_present(struct wsi_swapchain *wsi_chain,
    int err;
 
    MESA_TRACE_FUNC();
+
+   /* The frame the caller is waiting for may still be sitting in the deferred
+    * slot, in which case it has not been committed yet and could never
+    * complete. Flush it before waiting. */
+   ret = wsi_wl_swapchain_flush_deferred(chain);
+   if (ret != VK_SUCCESS)
+      return ret;
 
    uint64_t atimeout;
    if (timeout == 0 || timeout == UINT64_MAX)
@@ -2862,6 +2876,11 @@ wsi_wl_swapchain_wait_for_present2(struct wsi_swapchain *wsi_chain,
 
    MESA_TRACE_FUNC();
 
+   /* See wsi_wl_swapchain_wait_for_present(). */
+   ret = wsi_wl_swapchain_flush_deferred(chain);
+   if (ret != VK_SUCCESS)
+      return ret;
+
    uint64_t atimeout;
    if (timeout == 0 || timeout == UINT64_MAX)
       atimeout = timeout;
@@ -2906,6 +2925,10 @@ wsi_wl_swapchain_acquire_next_image_explicit(struct wsi_swapchain *wsi_chain,
    /* See comments in queue_present() */
    if (chain->retired)
       return VK_ERROR_OUT_OF_DATE_KHR;
+
+   VkResult defer_result = wsi_wl_swapchain_flush_deferred(chain);
+   if (defer_result != VK_SUCCESS)
+      return defer_result;
 
    STACK_ARRAY(struct wsi_image*, images, wsi_chain->image_count);
    for (uint32_t i = 0; i < chain->base.image_count; i++)
@@ -2954,6 +2977,8 @@ wsi_wl_swapchain_acquire_next_image_implicit(struct wsi_swapchain *wsi_chain,
    clock_gettime(CLOCK_MONOTONIC, &start_time);
    timespec_add(&end_time, &rel_timeout, &start_time);
 
+   bool defer_flushed = false;
+
    while (1) {
       /* If we can use timestamps, we want to make sure the queue feedback
        * events are in is dispatched so we eventually get a refresh rate
@@ -2973,6 +2998,14 @@ wsi_wl_swapchain_acquire_next_image_implicit(struct wsi_swapchain *wsi_chain,
             loader_wayland_buffer_set_flow(&chain->images[i].wayland_buffer, &flow);
             return (chain->suboptimal ? VK_SUBOPTIMAL_KHR : VK_SUCCESS);
          }
+      }
+
+      if (!defer_flushed && chain->defer_count) {
+         VkResult defer_result = wsi_wl_swapchain_flush_deferred_one(chain);
+         if (defer_result != VK_SUCCESS)
+            return defer_result;
+         defer_flushed = true;
+         continue;
       }
 
       /* Try to dispatch potential events. */
@@ -3015,9 +3048,6 @@ presentation_handle_presented(void *data,
     * There is a v3 proposal that adds this information more formally so we don't have to guess.
     * Knowing VRR or FRR is not mission critical for most use cases, so just report "Unknown" for now. */
    wsi_swapchain_present_timing_update_refresh_rate(&chain->base, refresh, 0, 0);
-
-   /* Convert whatever Wayland provides to swapchain time domain. */
-   presentation_time = wsi_wl_convert_wayland_to_swapchain_time(chain, presentation_time, false);
 
    /* Notify this before present wait to reduce latency of presentation timing requests
     * if the application is driving its queries based off present waits. */
@@ -3101,6 +3131,21 @@ presentation_frame_handle_done(void *data, struct wl_callback *callback, uint32_
 
 static const struct wl_callback_listener pres_frame_listener = {
    presentation_frame_handle_done,
+};
+
+static void
+wsi_wl_ahb_import_done(void *data, struct wl_callback *callback,
+                       UNUSED uint32_t serial)
+{
+   struct wsi_wl_swapchain *chain = data;
+
+   if (chain->ahb_import_callback == callback)
+      chain->ahb_import_callback = NULL;
+   wl_callback_destroy(callback);
+}
+
+static const struct wl_callback_listener ahb_import_listener = {
+   .done = wsi_wl_ahb_import_done,
 };
 
 static void
@@ -3233,24 +3278,52 @@ set_timestamp(struct wsi_wl_swapchain *chain,
    return true;
 }
 
+static const struct wl_buffer_listener buffer_listener;
+
 static VkResult
-wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
-                               uint32_t image_index,
-                               uint64_t present_id,
-                               const VkPresentRegionKHR *damage)
+wsi_wl_swapchain_present_now(struct wsi_swapchain *wsi_chain,
+                             uint32_t image_index,
+                             uint64_t present_id,
+                             const VkPresentRegionKHR *damage)
 {
    struct wsi_wl_swapchain *chain = (struct wsi_wl_swapchain *)wsi_chain;
    bool timestamped = false;
    bool queue_dispatched = false;
 
+   /* The blit into cpu_map must have completed before we copy it out. This is
+    * skipped by wsi_common_queue_present() for deferred swapchains. */
+   if (chain->base.image_info.image_type == WSI_IMAGE_TYPE_CPU &&
+       chain->base.fences[image_index] != VK_NULL_HANDLE) {
+      VkResult r = chain->base.wsi->WaitForFences(chain->base.device, 1,
+                                                  &chain->base.fences[image_index],
+                                                  true, ~0ull);
+      if (r != VK_SUCCESS)
+         return r;
+   }
+
    MESA_TRACE_FUNC_FLOW(&chain->images[image_index].wayland_buffer.flow);
 
    /* In case we're sending presentation feedback requests, make sure the
-    * queue their events are in is dispatched.
+    * queue containing their events is dispatched.  AHB swapchains using the
+    * linux-drm-syncobj protocol do not need to poll this queue for the common
+    * present_id == 0 case: no feedback object was queued, and the acquire /
+    * release points are shared kernel timelines rather than Wayland events.
+    * Avoiding the lock + poll on every direct present noticeably reduces the
+    * CPU cost of high-FPS immediate presents.  Keep dispatching as soon as a
+    * previous feedback request is outstanding (or for all other buffer
+    * types), since those callbacks still need to make forward progress.
     */
-   struct timespec instant = {0};
-   if (dispatch_present_id_queue(wsi_chain, &instant) == VK_ERROR_OUT_OF_DATE_KHR)
-      return VK_ERROR_OUT_OF_DATE_KHR;
+   bool dispatch_present_queue = true;
+   if (chain->buffer_type == WSI_WL_BUFFER_AHB) {
+      mtx_lock(&chain->present_ids.lock);
+      dispatch_present_queue = chain->present_ids.outstanding_count != 0;
+      mtx_unlock(&chain->present_ids.lock);
+   }
+   if (dispatch_present_queue) {
+      struct timespec instant = {0};
+      if (dispatch_present_id_queue(wsi_chain, &instant) == VK_ERROR_OUT_OF_DATE_KHR)
+         return VK_ERROR_OUT_OF_DATE_KHR;
+   }
 
    /* While the specification suggests we can keep presenting already acquired
     * images on a retired swapchain, there is no requirement to support that.
@@ -3302,6 +3375,29 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
                                                         image->wl_syncobj_timeline[WSI_ES_RELEASE],
                                                         (uint32_t)(release_point >> 32),
                                                         (uint32_t)(release_point & 0xffffffff));
+   }
+
+   /* Hand the compositor the client's rendering-complete fence as an acquire
+    * fence.  The semaphore was signaled by the pre-present submit on the queue
+    * after waiting on the application's present wait semaphores; exporting it
+    * as a sync file transfers that fence to the compositor, which waits on it
+    * on the GPU.  No CPU blocking and no effect on the client's frame rate. */
+   if (chain->base.semaphore_as_acquire_fence && chain->wl_surface_sync &&
+       chain->base.dma_buf_semaphore != VK_NULL_HANDLE) {
+      const VkSemaphoreGetFdInfoKHR get_fd_info = {
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+         .semaphore = chain->base.dma_buf_semaphore,
+         .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+      };
+      int acquire_fd = -1;
+      VkResult get_res =
+         chain->base.wsi->GetSemaphoreFdKHR(chain->base.device, &get_fd_info,
+                                            &acquire_fd);
+      if (get_res == VK_SUCCESS && acquire_fd >= 0) {
+         zwp_linux_surface_synchronization_v1_set_acquire_fence(
+            chain->wl_surface_sync, acquire_fd);
+         close(acquire_fd);
+      }
    }
 
    assert(image_index < chain->base.image_count);
@@ -3463,11 +3559,129 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
    wl_surface_commit(wsi_wl_surface->wayland_surface.wrapper);
    wl_display_flush(wsi_wl_surface->display->wl_display);
 
-   if (!queue_dispatched && wsi_chain->image_info.explicit_sync) {
+   /* With AHB direct scanout the compositor consumes the imported syncobj
+    * timelines directly.  Once the one-shot import barrier has completed,
+    * there is no release event to drain from the client queue, so
+    * dispatch_queue_pending() would only add per-frame event work.  Keep it
+    * enabled while the import barrier is outstanding so its callback (and any
+    * protocol error) is observed promptly.  Native dma-buf explicit sync keeps
+    * the old behavior because it may still have protocol events to process. */
+   if (!queue_dispatched &&
+       ((wsi_chain->image_info.explicit_sync &&
+         chain->buffer_type != WSI_WL_BUFFER_AHB) ||
+        chain->ahb_import_callback != NULL)) {
       wl_display_dispatch_queue_pending(wsi_wl_surface->display->wl_display,
                                         wsi_wl_surface->display->queue);
    }
 
+   memset(&chain->timing_request, 0, sizeof(chain->timing_request));
+
+   return VK_SUCCESS;
+}
+
+/* Complete a frame that was deferred by wsi_wl_swapchain_queue_present(). */
+static VkResult
+wsi_wl_swapchain_flush_deferred_one(struct wsi_wl_swapchain *chain)
+{
+   if (!chain->defer_count)
+      return VK_SUCCESS;
+
+   struct wsi_wl_deferred_present *deferred =
+      &chain->deferred[chain->defer_head];
+
+   if (chain->retired) {
+      chain->images[deferred->image_index].busy = false;
+   } else {
+      chain->base.present_mode = deferred->present_mode;
+      chain->timing_request = deferred->timing_request;
+      VkResult result = wsi_wl_swapchain_present_now(
+         &chain->base, deferred->image_index, deferred->present_id,
+         deferred->has_damage ? &deferred->damage : NULL);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   chain->defer_head = (chain->defer_head + 1) % WSI_WL_MAX_DEFER_DEPTH;
+   chain->defer_count--;
+   return VK_SUCCESS;
+}
+
+static VkResult
+wsi_wl_swapchain_flush_deferred(struct wsi_wl_swapchain *chain)
+{
+   while (chain->defer_count) {
+      VkResult result = wsi_wl_swapchain_flush_deferred_one(chain);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   return VK_SUCCESS;
+}
+
+/* Keep several IMMEDIATE presents pending so CPU frame preparation can overlap
+ * the render and readback work for older frames. */
+static VkResult
+wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
+                               uint32_t image_index,
+                               uint64_t present_id,
+                               const VkPresentRegionKHR *damage)
+{
+   struct wsi_wl_swapchain *chain = (struct wsi_wl_swapchain *)wsi_chain;
+   VkResult result;
+
+   if (!chain->defer_enabled)
+      return wsi_wl_swapchain_present_now(wsi_chain, image_index, present_id,
+                                          damage);
+
+   VkPresentModeKHR present_mode = chain->base.present_mode;
+   struct wsi_image_timing_request timing_request = chain->timing_request;
+   memset(&chain->timing_request, 0, sizeof(chain->timing_request));
+
+   bool allow_deep_defer =
+      present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR &&
+      present_id == 0 && !timing_request.serial;
+   if (allow_deep_defer) {
+      for (uint32_t i = 0; i < chain->defer_count; i++) {
+         uint32_t index =
+            (chain->defer_head + i) % WSI_WL_MAX_DEFER_DEPTH;
+         struct wsi_wl_deferred_present *queued = &chain->deferred[index];
+         if (queued->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR ||
+             queued->present_id != 0 || queued->timing_request.serial) {
+            allow_deep_defer = false;
+            break;
+         }
+      }
+   }
+
+   uint32_t defer_depth = allow_deep_defer ? chain->defer_depth : 1;
+   while (chain->defer_count >= defer_depth) {
+      result = wsi_wl_swapchain_flush_deferred_one(chain);
+      if (result != VK_SUCCESS) {
+         chain->images[image_index].busy = false;
+         chain->base.present_mode = present_mode;
+         memset(&chain->timing_request, 0, sizeof(chain->timing_request));
+         return result;
+      }
+      chain->base.present_mode = present_mode;
+      chain->timing_request = timing_request;
+   }
+
+   uint32_t defer_tail =
+      (chain->defer_head + chain->defer_count) % WSI_WL_MAX_DEFER_DEPTH;
+   struct wsi_wl_deferred_present *deferred = &chain->deferred[defer_tail];
+   deferred->image_index = image_index;
+   deferred->present_id = present_id;
+   deferred->present_mode = present_mode;
+   deferred->timing_request = timing_request;
+   deferred->has_damage = false;
+   if (damage && damage->pRectangles && damage->rectangleCount > 0 &&
+       damage->rectangleCount <= WSI_WL_MAX_DEFER_DAMAGE_RECTS) {
+      memcpy(deferred->damage_rects, damage->pRectangles,
+             damage->rectangleCount * sizeof(deferred->damage_rects[0]));
+      deferred->damage.pRectangles = deferred->damage_rects;
+      deferred->damage.rectangleCount = damage->rectangleCount;
+      deferred->has_damage = true;
+   }
+   chain->defer_count++;
    memset(&chain->timing_request, 0, sizeof(chain->timing_request));
 
    return VK_SUCCESS;
@@ -3478,14 +3692,339 @@ buffer_handle_release(void *data, struct wl_buffer *buffer)
 {
    struct wsi_wl_image *image = data;
 
-   assert(image->wayland_buffer.buffer == buffer);
-
-   image->busy = false;
+   if (image->wayland_buffer.buffer == buffer) {
+      /* The buffer currently in flight was released. */
+      image->busy = false;
+   }
 }
 
 static const struct wl_buffer_listener buffer_listener = {
    buffer_handle_release,
 };
+
+#if WSI_WL_HAS_AHB
+#define WINFUSION_AHB_SOCKET_MAGIC 0x57464148u
+
+struct winfusion_ahb_socket_header {
+   uint32_t magic;
+   uint32_t version;
+   uint32_t width;
+   uint32_t height;
+   uint32_t format;
+   uint32_t stride;
+   uint64_t size;
+   uint64_t modifier;
+};
+
+static bool
+wsi_wl_write_full(int fd, const void *data, size_t size)
+{
+   const uint8_t *p = data;
+
+   while (size > 0) {
+      ssize_t ret = write(fd, p, size);
+      if (ret < 0) {
+         if (errno == EINTR)
+            continue;
+         return false;
+      }
+      if (ret == 0)
+         return false;
+      p += ret;
+      size -= ret;
+   }
+
+   return true;
+}
+
+static bool
+wsi_wl_ahb_format_supported(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_B8G8R8A8_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+wsi_wl_ahb_image_supported(const struct wsi_device *wsi,
+                           const VkSwapchainCreateInfoKHR *create_info)
+{
+   if (!wsi_wl_ahb_format_supported(create_info->imageFormat))
+      return false;
+
+   VkImageCreateFlags flags = VK_IMAGE_CREATE_ALIAS_BIT;
+   if (create_info->flags & VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR)
+      flags |= VK_IMAGE_CREATE_PROTECTED_BIT;
+   if (create_info->flags & VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR)
+      flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+               VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+   if (create_info->flags &
+       VK_SWAPCHAIN_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT) {
+      flags |= VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT;
+   }
+
+   const VkImageUsageFlags2KHR usage =
+      vk_swapchain_usage_flags(create_info) | VK_IMAGE_USAGE_SAMPLED_BIT;
+   VkImageUsageFlags2CreateInfoKHR usage_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_USAGE_FLAGS_2_CREATE_INFO_KHR,
+      .usage = usage,
+   };
+   VkPhysicalDeviceExternalImageFormatInfo external_info = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+      .pNext = &usage_info,
+      .handleType =
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
+   };
+
+   VkImageFormatListCreateInfo format_list;
+   if (flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
+      const VkImageFormatListCreateInfo *format_list_in =
+         vk_find_struct_const(create_info->pNext,
+                              IMAGE_FORMAT_LIST_CREATE_INFO);
+      if (!format_list_in)
+         return false;
+
+      format_list = *format_list_in;
+      format_list.pNext = NULL;
+      __vk_append_struct(&external_info, &format_list);
+   }
+
+   const VkPhysicalDeviceImageFormatInfo2 format_info = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+      .pNext = &external_info,
+      .format = create_info->imageFormat,
+      .type = VK_IMAGE_TYPE_2D,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = usage,
+      .flags = flags,
+   };
+   VkExternalImageFormatProperties external_props = {
+      .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+   };
+   VkImageFormatProperties2 format_props = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+      .pNext = &external_props,
+   };
+
+   VkResult result = wsi->GetPhysicalDeviceImageFormatProperties2(
+      wsi->pdevice, &format_info, &format_props);
+   bool supported =
+      result == VK_SUCCESS &&
+      create_info->imageExtent.width <=
+         format_props.imageFormatProperties.maxExtent.width &&
+      create_info->imageExtent.height <=
+         format_props.imageFormatProperties.maxExtent.height &&
+       (external_props.externalMemoryProperties.externalMemoryFeatures &
+        VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT);
+   return supported;
+}
+
+/* The compositor derives the buffer size and DRM modifier from the
+ * AHardwareBuffer's native handle, so the client has to report the exact same
+ * values in the socket header.  Mirror the compositor's inspection: the size
+ * is the dma-buf's length and the modifier is UBWC-compressed only when the
+ * gralloc flag is set, anything else being linear. */
+static bool
+wsi_wl_ahb_get_layout(AHardwareBuffer *ahb, uint64_t *size, uint64_t *modifier)
+{
+   const native_handle_t *handle = AHardwareBuffer_getNativeHandle(ahb);
+   const uint32_t qcom_magic = ('g' << 24) | ('m' << 16) | ('s' << 8) | 'm';
+   struct stat statbuf;
+
+   if (!handle || handle->numFds < 1 || handle->numInts < 2)
+      return false;
+
+   if ((uint32_t)handle->data[handle->numFds] != qcom_magic)
+      return false;
+
+   if (fstat(handle->data[0], &statbuf) < 0 || statbuf.st_size <= 0)
+      return false;
+
+   *size = statbuf.st_size;
+   *modifier = (handle->data[handle->numFds + 1] & 0x08000000) ?
+      DRM_FORMAT_MOD_QCOM_COMPRESSED : DRM_FORMAT_MOD_LINEAR;
+   return true;
+}
+
+static VkResult
+wsi_wl_create_ahb_image_mem(const struct wsi_swapchain *wsi_chain,
+                            const struct wsi_image_info *info,
+                            struct wsi_image *base_image)
+{
+   struct wsi_wl_image *image =
+      container_of(base_image, struct wsi_wl_image, base);
+   const struct wsi_device *wsi = wsi_chain->wsi;
+   const struct wsi_memory_allocate_info wsi_info = {
+      .sType = VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA,
+      .implicit_sync = !info->explicit_sync && !wsi_chain->dma_buf_semaphore,
+      .dma_buf_sync_file = wsi_chain->dma_buf_semaphore,
+   };
+   const VkExportMemoryAllocateInfo export_info = {
+      .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+      .pNext = &wsi_info,
+      .handleTypes =
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
+   };
+   const VkMemoryDedicatedAllocateInfo dedicated_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+      .pNext = &export_info,
+      .image = base_image->image,
+   };
+   const VkMemoryAllocateInfo memory_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = &dedicated_info,
+      /* AHB image exports are dedicated and derive their allocation from the
+       * image description; allocationSize and memoryTypeIndex are ignored. */
+      .allocationSize = 0,
+      .memoryTypeIndex = 0,
+   };
+
+   VkResult result = wsi->AllocateMemory(wsi_chain->device, &memory_info,
+                                         &wsi_chain->alloc,
+                                         &base_image->memory);
+   if (result != VK_SUCCESS)
+      return result;
+
+   const VkMemoryGetAndroidHardwareBufferInfoANDROID get_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_GET_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,
+      .memory = base_image->memory,
+   };
+   result = wsi->GetMemoryAndroidHardwareBufferANDROID(
+      wsi_chain->device, &get_info, &image->winfusion_ahb);
+   if (result != VK_SUCCESS)
+      return result;
+
+   AHardwareBuffer_Desc desc;
+   AHardwareBuffer_describe(image->winfusion_ahb, &desc);
+   image->winfusion_stride =
+      desc.stride * vk_format_get_blocksize(info->create.format);
+
+   /* The compositor validates the reported size and modifier against the
+    * AHardwareBuffer's native handle, so derive them here the same way. */
+   if (!wsi_wl_ahb_get_layout(image->winfusion_ahb, &image->winfusion_size,
+                              &image->winfusion_modifier)) {
+      AHardwareBuffer_release(image->winfusion_ahb);
+      image->winfusion_ahb = NULL;
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   /* Explicit sync does not use the dma-buf's implicit fence state.  Avoid
+    * keeping an otherwise unused fd per image on that path. */
+   if (!info->explicit_sync) {
+      const native_handle_t *handle =
+         AHardwareBuffer_getNativeHandle(image->winfusion_ahb);
+
+      base_image->dma_buf_fd = os_dupfd_cloexec(handle->data[0]);
+      if (base_image->dma_buf_fd < 0) {
+         AHardwareBuffer_release(image->winfusion_ahb);
+         image->winfusion_ahb = NULL;
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+   }
+
+   base_image->drm_modifier = DRM_FORMAT_MOD_INVALID;
+   base_image->num_planes = 1;
+   base_image->offsets[0] = 0;
+   base_image->row_pitches[0] = image->winfusion_stride;
+   base_image->sizes[0] = MIN2(image->winfusion_size, UINT32_MAX);
+   return VK_SUCCESS;
+}
+
+static VkResult
+wsi_wl_import_ahb_buffer(struct wsi_wl_swapchain *chain,
+                         struct wsi_wl_image *image)
+{
+   struct wsi_wl_display *display = chain->wsi_wl_surface->display;
+   const struct winfusion_ahb_socket_header header = {
+      .magic = WINFUSION_AHB_SOCKET_MAGIC,
+      .version = 1,
+      .width = chain->extent.width,
+      .height = chain->extent.height,
+      .format = chain->drm_format,
+      .stride = image->winfusion_stride,
+      .size = image->winfusion_size,
+      .modifier = image->winfusion_modifier,
+   };
+   int sock[2];
+
+   if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sock) < 0)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   if (!wsi_wl_write_full(sock[0], &header, sizeof(header)) ||
+       AHardwareBuffer_sendHandleToUnixSocket(image->winfusion_ahb,
+                                               sock[0]) != 0) {
+      close(sock[0]);
+      close(sock[1]);
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
+   close(sock[0]);
+
+   struct wl_buffer *buffer =
+      zwp_winfusion_buffer_v1_import_buffer(display->winfusion_buffer,
+                                            chain->extent.width,
+                                            chain->extent.height,
+                                            chain->drm_format,
+                                            sock[1]);
+   close(sock[1]);
+   if (!buffer)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   loader_wayland_wrap_buffer(&image->wayland_buffer, buffer);
+   return VK_SUCCESS;
+}
+
+static void
+wsi_wl_release_ahb(struct wsi_wl_image *image)
+{
+   if (image->winfusion_ahb) {
+      AHardwareBuffer_release(image->winfusion_ahb);
+      image->winfusion_ahb = NULL;
+   }
+}
+#else
+static VkResult
+wsi_wl_create_ahb_image_mem(UNUSED const struct wsi_swapchain *wsi_chain,
+                            UNUSED const struct wsi_image_info *info,
+                            UNUSED struct wsi_image *base_image)
+{
+   return VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
+static VkResult
+wsi_wl_import_ahb_buffer(UNUSED struct wsi_wl_swapchain *chain,
+                         UNUSED struct wsi_wl_image *image)
+{
+   return VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
+static void
+wsi_wl_release_ahb(UNUSED struct wsi_wl_image *image)
+{
+}
+#endif
+
+static VkResult
+wsi_wl_import_image_syncobj_timelines(struct wsi_wl_display *display,
+                                      struct wsi_wl_swapchain *chain,
+                                      struct wsi_wl_image *image)
+{
+   if (!chain->base.image_info.explicit_sync)
+      return VK_SUCCESS;
+
+   for (uint32_t i = 0; i < WSI_ES_COUNT; i++) {
+      image->wl_syncobj_timeline[i] =
+         wp_linux_drm_syncobj_manager_v1_import_timeline(
+            display->wl_syncobj, image->base.explicit_sync[i].fd);
+      if (!image->wl_syncobj_timeline[i])
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
+   return VK_SUCCESS;
+}
 
 static uint8_t *
 wsi_wl_alloc_image_shm(struct wsi_image *imagew, unsigned size)
@@ -3513,16 +4052,18 @@ wsi_wl_alloc_image_shm(struct wsi_image *imagew, unsigned size)
 static VkResult
 wsi_wl_image_init(struct wsi_wl_swapchain *chain,
                   struct wsi_wl_image *image,
-                  const VkSwapchainCreateInfoKHR *pCreateInfo,
-                  const VkAllocationCallbacks* pAllocator)
+                  UNUSED const VkSwapchainCreateInfoKHR *pCreateInfo,
+                  UNUSED const VkAllocationCallbacks* pAllocator)
 {
    struct wsi_wl_display *display = chain->wsi_wl_surface->display;
    VkResult result;
 
+   image->winfusion_ahb = NULL;
+
    result = wsi_create_image(&chain->base, &chain->base.image_info,
                              &image->base);
    if (result != VK_SUCCESS)
-      return result;
+      goto fail_buffer;
 
    switch (chain->buffer_type) {
    case WSI_WL_BUFFER_GPU_SHM:
@@ -3575,18 +4116,22 @@ wsi_wl_image_init(struct wsi_wl_swapchain *chain,
       zwp_linux_buffer_params_v1_destroy(params);
       loader_wayland_wrap_buffer(&image->wayland_buffer, buffer);
 
-      if (chain->base.image_info.explicit_sync) {
-         for (uint32_t i = 0; i < WSI_ES_COUNT; i++) {
-            image->wl_syncobj_timeline[i] =
-               wp_linux_drm_syncobj_manager_v1_import_timeline(display->wl_syncobj,
-                                                               image->base.explicit_sync[i].fd);
-            if (!image->wl_syncobj_timeline[i])
-               goto fail_image;
-         }
-      }
+      result = wsi_wl_import_image_syncobj_timelines(display, chain, image);
+      if (result != VK_SUCCESS)
+         goto fail_image;
 
       break;
    }
+
+   case WSI_WL_BUFFER_AHB:
+      result = wsi_wl_import_ahb_buffer(chain, image);
+      if (result != VK_SUCCESS)
+         goto fail_image;
+
+      result = wsi_wl_import_image_syncobj_timelines(display, chain, image);
+      if (result != VK_SUCCESS)
+         goto fail_image;
+      break;
 
    default:
       UNREACHABLE("Invalid buffer type");
@@ -3602,13 +4147,15 @@ wsi_wl_image_init(struct wsi_wl_swapchain *chain,
    return VK_SUCCESS;
 
 fail_image:
-   for (uint32_t i = 0; i < WSI_ES_COUNT; i++) {
-      if (image->wl_syncobj_timeline[i])
-         wp_linux_drm_syncobj_timeline_v1_destroy(image->wl_syncobj_timeline[i]);
-   }
-   wsi_destroy_image(&chain->base, &image->base);
+   /* The swapchain failure path owns cleanup for an image that was created
+    * successfully but failed while creating its Wayland-side resources. */
+   return result == VK_SUCCESS ? VK_ERROR_OUT_OF_HOST_MEMORY : result;
 
-   return VK_ERROR_OUT_OF_HOST_MEMORY;
+fail_buffer:
+   /* wsi_create_image() already destroyed any partial Vulkan resources. */
+   memset(&image->base, 0, sizeof(image->base));
+   wsi_wl_release_ahb(image);
+   return result;
 }
 
 static void
@@ -3619,13 +4166,18 @@ wsi_wl_swapchain_images_free(struct wsi_wl_swapchain *chain)
          if (chain->images[i].wl_syncobj_timeline[j])
             wp_linux_drm_syncobj_timeline_v1_destroy(chain->images[i].wl_syncobj_timeline[j]);
       }
-      if (chain->images[i].wayland_buffer.buffer) {
+      if (chain->images[i].wayland_buffer.buffer)
          loader_wayland_buffer_destroy(&chain->images[i].wayland_buffer);
+
+      if (chain->images[i].base.image != VK_NULL_HANDLE ||
+          chain->images[i].base.memory != VK_NULL_HANDLE) {
          wsi_destroy_image(&chain->base, &chain->images[i].base);
-         if (chain->images[i].shm_size) {
-            close(chain->images[i].shm_fd);
-            munmap(chain->images[i].shm_ptr, chain->images[i].shm_size);
-         }
+      }
+      wsi_wl_release_ahb(&chain->images[i]);
+
+      if (chain->images[i].shm_size) {
+         close(chain->images[i].shm_fd);
+         munmap(chain->images[i].shm_ptr, chain->images[i].shm_size);
       }
    }
 }
@@ -3645,10 +4197,14 @@ wsi_wl_swapchain_chain_free(struct wsi_wl_swapchain *chain,
 
    if (chain->frame)
       wl_callback_destroy(chain->frame);
+   if (chain->ahb_import_callback)
+      wl_callback_destroy(chain->ahb_import_callback);
    if (chain->tearing_control)
       wp_tearing_control_v1_destroy(chain->tearing_control);
    if (chain->wl_syncobj_surface)
       wp_linux_drm_syncobj_surface_v1_destroy(chain->wl_syncobj_surface);
+   if (chain->wl_surface_sync)
+      zwp_linux_surface_synchronization_v1_destroy(chain->wl_surface_sync);
    if (chain->color.color_surface)
       wp_color_management_surface_v1_destroy(chain->color.color_surface);
 
@@ -3697,12 +4253,29 @@ wsi_wl_swapchain_destroy(struct wsi_swapchain *wsi_chain,
 {
    struct wsi_wl_swapchain *chain = (struct wsi_wl_swapchain *)wsi_chain;
 
+   /* Drop deferred frames; their images are about to go away. */
+   chain->defer_count = 0;
+
    wsi_wl_swapchain_images_free(chain);
    wsi_wl_swapchain_chain_free(chain, pAllocator);
 
    vk_free(pAllocator, chain);
 
    return VK_SUCCESS;
+}
+
+static VkTimeDomainKHR
+clock_id_to_vk_time_domain(clockid_t id)
+{
+   switch (id) {
+      case CLOCK_MONOTONIC:
+         return VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+      case CLOCK_MONOTONIC_RAW:
+         return VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR;
+      default:
+         /* Default fallback. Will not be used. */
+         return VK_TIME_DOMAIN_DEVICE_KHR;
+   }
 }
 
 static VkResult
@@ -3725,16 +4298,20 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
     * oldSwapchain is retired - even if creation of the new swapchain fails. */
    if (pCreateInfo->oldSwapchain) {
       VK_FROM_HANDLE(wsi_wl_swapchain, old_chain, pCreateInfo->oldSwapchain);
-      /* oldSwapchain is extern-sync, so it is not possible to call AcquireNextImage or QueuePresent
-       * concurrently with this function. Next call to acquire or present will immediately
-       * return OUT_OF_DATE. */
+      /* oldSwapchain is externally synchronized, so pending presents can be
+       * drained before retiring it. */
+      result = wsi_wl_swapchain_flush_deferred(old_chain);
       old_chain->retired = true;
+      if (result != VK_SUCCESS)
+         return result;
    }
 
    /* We need to allocate the chain handle early, since display initialization code relies on it.
     * We do not know the actual image count until we have initialized the display handle,
     * so allocate conservatively in case we need to bump the image count. */
-   size_t size = sizeof(*chain) + MAX2(WSI_WL_BUMPED_NUM_IMAGES, pCreateInfo->minImageCount) * sizeof(chain->images[0]);
+   size_t size = sizeof(*chain) +
+                 MAX2(MAX2(WSI_WL_BUMPED_NUM_IMAGES, WSI_WL_SHM_NUM_IMAGES),
+                      pCreateInfo->minImageCount) * sizeof(chain->images[0]);
    chain = vk_zalloc(pAllocator, size, 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (chain == NULL)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -3767,6 +4344,10 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       if (old_chain->wl_syncobj_surface) {
          wp_linux_drm_syncobj_surface_v1_destroy(old_chain->wl_syncobj_surface);
          old_chain->wl_syncobj_surface = NULL;
+      }
+      if (old_chain->wl_surface_sync) {
+         zwp_linux_surface_synchronization_v1_destroy(old_chain->wl_surface_sync);
+         old_chain->wl_surface_sync = NULL;
       }
       if (old_chain->color.color_surface) {
          wp_color_management_surface_v1_destroy(old_chain->color.color_surface);
@@ -3820,13 +4401,40 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    struct wsi_base_image_params *image_params = NULL;
    struct wsi_cpu_image_params cpu_image_params;
    struct wsi_drm_image_params drm_image_params;
+   struct wsi_ahb_image_params ahb_image_params;
    uint32_t num_drm_modifiers = 0;
    const uint64_t *drm_modifiers = NULL;
-   if (wsi_device->sw) {
+   bool use_shm = !wsi_wl_surface->display->wl_dmabuf &&
+                  wsi_wl_surface->display->wl_shm;
+
+   bool use_winfusion_ahb = false;
+#if WSI_WL_HAS_AHB
+   if (wsi_wl_surface->display->winfusion_buffer) {
+      const uint32_t version = wl_proxy_get_version(
+         (struct wl_proxy *)wsi_wl_surface->display->winfusion_buffer);
+      use_winfusion_ahb =
+         version >= ZWP_WINFUSION_BUFFER_V1_IMPORT_BUFFER_SINCE_VERSION &&
+         !wsi_device->sw &&
+         wsi_device->has_android_hardware_buffer &&
+         wsi_device->GetMemoryAndroidHardwareBufferANDROID != NULL &&
+         wsi_wl_ahb_image_supported(wsi_device, pCreateInfo);
+   }
+#endif
+
+   if (use_winfusion_ahb) {
+      ahb_image_params = (struct wsi_ahb_image_params) {
+         .base.image_type = WSI_IMAGE_TYPE_AHB,
+         .explicit_sync = wsi_wl_use_explicit_sync(wsi_wl_surface->display,
+                                                    wsi_device),
+         .create_mem = wsi_wl_create_ahb_image_mem,
+      };
+      buffer_type = WSI_WL_BUFFER_AHB;
+      image_params = &ahb_image_params.base;
+   } else if (wsi_device->sw || use_shm) {
       cpu_image_params = (struct wsi_cpu_image_params) {
          .base.image_type = WSI_IMAGE_TYPE_CPU,
       };
-      if (wsi_device->has_import_memory_host &&
+      if (wsi_device->sw && wsi_device->has_import_memory_host &&
           !(WSI_DEBUG & WSI_DEBUG_NOSHM)) {
          buffer_type = WSI_WL_BUFFER_GPU_SHM;
          cpu_image_params.alloc_shm = wsi_wl_alloc_image_shm;
@@ -3869,6 +4477,28 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       image_params = &drm_image_params.base;
    }
 
+   /* See WSI_WL_SHM_NUM_IMAGES: the memcpy path is throttled by the
+    * compositor's release cadence rather than by our own submissions, so give
+    * it a deeper pool to hide that latency. */
+   if (buffer_type == WSI_WL_BUFFER_SHM_MEMCPY &&
+       present_mode != VK_PRESENT_MODE_FIFO_KHR &&
+       present_mode != VK_PRESENT_MODE_FIFO_RELAXED_KHR)
+      num_images = MAX2(num_images, WSI_WL_SHM_NUM_IMAGES);
+
+   /* Same reasoning for the private AHB path: it is paced by the compositor's
+    * release cadence, so a deeper pool keeps AcquireNextImage from blocking.
+    * FIFO modes are intentionally excluded: a deep FIFO queue adds latency
+    * without helping throughput. */
+   if (buffer_type == WSI_WL_BUFFER_AHB &&
+       present_mode != VK_PRESENT_MODE_FIFO_KHR &&
+       present_mode != VK_PRESENT_MODE_FIFO_RELAXED_KHR) {
+      uint32_t ahb_images = CLAMP(
+         debug_get_num_option("WINFUSION_WSI_AHB_IMAGES",
+                              WSI_WL_AHB_NUM_IMAGES_DEFAULT),
+         1, WSI_WL_AHB_NUM_IMAGES_MAX);
+      num_images = MAX2(num_images, ahb_images);
+   }
+
    result = wsi_swapchain_init(wsi_device, &chain->base, device,
                                pCreateInfo, image_params, pAllocator);
    if (result != VK_SUCCESS)
@@ -3887,15 +4517,7 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    chain->base.set_present_mode = wsi_wl_swapchain_set_present_mode;
    chain->base.set_timing_request = wsi_wl_swapchain_set_timing_request;
    chain->base.poll_timing_request = wsi_wl_swapchain_poll_timing_request;
-
-   if (pCreateInfo->flags & VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT) {
-      /* VK_EXT_present_timing takes whatever Wayland gives us. */
-      chain->base.present_timing.time_domain = clock_id_to_vk_time_domain(wsi_wl_surface->display->presentation_clock_id);
-   } else {
-      /* VK_GOOGLE_display_timing always wants VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR. */
-      chain->base.present_timing.time_domain = VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
-   }
-
+   chain->base.present_timing.time_domain = clock_id_to_vk_time_domain(wsi_wl_surface->display->presentation_clock_id);
    chain->base.wait_for_present = wsi_wl_swapchain_wait_for_present;
    chain->base.wait_for_present2 = wsi_wl_swapchain_wait_for_present2;
    chain->base.present_mode = present_mode;
@@ -3904,7 +4526,23 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    chain->extent = pCreateInfo->imageExtent;
    chain->vk_format = pCreateInfo->imageFormat;
    chain->buffer_type = buffer_type;
+
+   /* Only the memcpy path benefits: it is the one that has to block on the
+    * render fence before touching cpu_map. Allow opting out at runtime for
+    * bisecting visual issues. */
+   chain->defer_enabled =
+      buffer_type == WSI_WL_BUFFER_SHM_MEMCPY &&
+      !uses_present_mode_group &&
+      !debug_get_bool_option("WINFUSION_WSI_NO_DEFER", false);
+   chain->base.defer_present_fence_wait = chain->defer_enabled;
+   chain->defer_depth = CLAMP(
+      debug_get_num_option("WINFUSION_WSI_DEFER_DEPTH", 3),
+      1, WSI_WL_MAX_DEFER_DEPTH);
+
    if (buffer_type == WSI_WL_BUFFER_NATIVE) {
+      chain->drm_format = wl_drm_format_for_vk_format(wsi_device,
+                                                      chain->vk_format, alpha);
+   } else if (buffer_type == WSI_WL_BUFFER_AHB) {
       chain->drm_format = wl_drm_format_for_vk_format(wsi_device,
                                                       chain->vk_format, alpha);
    } else {
@@ -3985,7 +4623,7 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
                                                   WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC);
    }
 
-   if (wsi_wl_use_explicit_sync(dpy, wsi_device)) {
+   if (chain->base.image_info.explicit_sync) {
       chain->wl_syncobj_surface =
          wp_linux_drm_syncobj_manager_v1_get_surface(dpy->wl_syncobj,
                                                      chain->wsi_wl_surface->wayland_surface.wrapper);
@@ -4012,6 +4650,70 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       if (result != VK_SUCCESS)
          goto fail_free_wl_images;
       chain->images[i].busy = false;
+   }
+
+   /*
+    * AHB is zero-copy: the client renders straight into the buffer the
+    * compositor samples, so the compositor must not sample it before the
+    * client's GPU work has finished.  Prefer kernel dma-buf implicit sync;
+    * where the kernel cannot carry fences on the gralloc dma-buf, fall back to
+    * handing the compositor an explicit acquire fence (a sync file), which the
+    * GL renderer waits on in the GPU without blocking the CPU.
+    */
+   if (buffer_type == WSI_WL_BUFFER_AHB && !chain->base.image_info.explicit_sync) {
+      /* wp_linux_drm_syncobj is unavailable here (KGSL exposes no DRM device),
+       * so the compositor is told about the client's rendering-complete fence
+       * through the older zwp_linux_explicit_synchronization_v1 protocol,
+       * which winfusion's compositor always advertises. */
+      bool acquire_fence =
+         dpy->wl_explicit_sync != NULL &&
+         !wsi_device->sw &&
+         (wsi_device->semaphore_export_handle_types &
+          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT) != 0;
+#ifdef HAVE_LIBDRM
+      result = wsi_drm_init_ahb_implicit_sync(&chain->base,
+                                             chain->images[0].base.dma_buf_fd,
+                                             acquire_fence);
+      if (result != VK_SUCCESS)
+         goto fail_free_wl_images;
+      acquire_fence = chain->base.semaphore_as_acquire_fence;
+#else
+      (void) acquire_fence;
+#endif
+      if (acquire_fence) {
+         chain->wl_surface_sync =
+            zwp_linux_explicit_synchronization_v1_get_synchronization(
+               dpy->wl_explicit_sync,
+               chain->wsi_wl_surface->wayland_surface.wrapper);
+         if (!chain->wl_surface_sync) {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto fail_free_wl_images;
+         }
+      }
+   }
+
+   if (buffer_type == WSI_WL_BUFFER_AHB) {
+      /* All import_buffer requests are ordered before this sync request.  A
+       * roundtrip used to wait here for the compositor even though the
+       * requests are safe to queue asynchronously; the first present will
+       * still observe the same ordering on the Wayland connection.  Keep the
+       * callback alive until the compositor has consumed the requests so
+       * protocol errors can be observed by the normal event dispatch path. */
+      chain->ahb_import_callback = wl_display_sync(dpy->wl_display_wrapper);
+      if (!chain->ahb_import_callback) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto fail_free_wl_images;
+      }
+      wl_callback_add_listener(chain->ahb_import_callback,
+                               &ahb_import_listener, chain);
+
+      /* Flush now to avoid retaining the AHB handle fds in wayland-client's
+       * outgoing queue.  EAGAIN is expected for a temporarily full socket;
+       * the next WSI request will retry the flush. */
+      if (wl_display_flush(dpy->wl_display) < 0 && errno != EAGAIN) {
+         result = VK_ERROR_SURFACE_LOST_KHR;
+         goto fail_free_wl_images;
+      }
    }
 
    chain->present_ids.valid_refresh_nsec = false;

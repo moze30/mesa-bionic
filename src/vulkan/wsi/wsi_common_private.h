@@ -33,6 +33,7 @@ extern "C" {
 #endif
 
 struct wsi_image;
+struct wsi_image_info;
 struct wsi_swapchain;
 
 #define WSI_DEBUG_BUFFER      (1ull << 0)
@@ -47,6 +48,7 @@ extern uint64_t WSI_DEBUG;
 enum wsi_image_type {
    WSI_IMAGE_TYPE_CPU,
    WSI_IMAGE_TYPE_DRM,
+   WSI_IMAGE_TYPE_AHB,
    WSI_IMAGE_TYPE_DXGI,
    WSI_IMAGE_TYPE_METAL,
 };
@@ -71,6 +73,18 @@ struct wsi_drm_image_params {
    uint32_t num_modifier_lists;
    const uint32_t *num_modifiers;
    const uint64_t *const *modifiers;
+};
+
+struct wsi_ahb_image_params {
+   struct wsi_base_image_params base;
+
+   /* Whether the window system can synchronize the AHB with syncobj
+    * acquire/release points instead of dma-buf implicit fences. */
+   bool explicit_sync;
+
+   VkResult (*create_mem)(const struct wsi_swapchain *chain,
+                          const struct wsi_image_info *info,
+                          struct wsi_image *image);
 };
 
 struct wsi_dxgi_image_params {
@@ -251,6 +265,15 @@ struct wsi_swapchain {
     */
    VkSemaphore dma_buf_semaphore;
 
+   /**
+    * When true, dma_buf_semaphore is not imported into the image's dma-buf.
+    * Instead the WSI backend exports it as a sync file and hands it to the
+    * window system as an acquire fence, which is how swapchains without
+    * kernel dma-buf sync-file support (e.g. Android KGSL) tell the compositor
+    * to wait for the client's rendering.
+    */
+   bool semaphore_as_acquire_fence;
+
    struct wsi_image_info image_info;
    uint32_t image_count;
 
@@ -296,6 +319,11 @@ struct wsi_swapchain {
       uint64_t minimum_queue_done_time;
       uint64_t minimum_complete_time;
    } present_timing;
+
+   /* Set by a WSI backend that defers the present (and therefore the wait on
+    * the render fence) until the next frame, so wsi_common_queue_present()
+    * must not block on that fence itself. */
+   bool defer_present_fence_wait;
 
    /* Command pools, one per queue family */
    VkCommandPool *cmd_pools;
@@ -503,6 +531,10 @@ wsi_drm_wait_for_explicit_sync_release(struct wsi_swapchain *chain,
 
 VkResult
 wsi_drm_init_swapchain_implicit_sync(struct wsi_swapchain *chain);
+
+VkResult
+wsi_drm_init_ahb_implicit_sync(struct wsi_swapchain *chain, int dma_buf_fd,
+                               bool have_explicit_sync);
 
 #endif
 

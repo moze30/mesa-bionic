@@ -75,6 +75,9 @@ struct wsi_device {
    bool has_import_memory_host;
    bool has_timeline_semaphore;
    bool has_host_query_reset;
+#if defined(VK_USE_PLATFORM_ANDROID_KHR) && ANDROID_API_LEVEL >= 26
+   bool has_android_hardware_buffer;
+#endif
 
    /** Whether the device uses 32bpp formats for 24bpp
     *
@@ -233,6 +236,9 @@ struct wsi_device {
    WSI_CB(GetImageMemoryRequirements);
    WSI_CB(GetImageSubresourceLayout);
    WSI_CB(GetMemoryFdKHR);
+#if defined(VK_USE_PLATFORM_ANDROID_KHR) && ANDROID_API_LEVEL >= 26
+   WSI_CB(GetMemoryAndroidHardwareBufferANDROID);
+#endif
    WSI_CB(GetPhysicalDeviceCalibrateableTimeDomainsKHR);
    WSI_CB(GetPhysicalDeviceProperties);
    WSI_CB(GetPhysicalDeviceFormatProperties);

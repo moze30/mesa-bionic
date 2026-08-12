@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="winfusion_buffer_v1">
+  <copyright>
+    Copyright © 2026 WinFusion
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice (including the next
+    paragraph) shall be included in all copies or substantial portions of the
+    Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+  </copyright>
+
+  <description summary="zero-copy AHardwareBuffer buffers for WinFusion">
+    WinFusion private protocol for sharing AHardwareBuffers with the
+    compositor. A buffer is transferred as a serialized AHardwareBuffer
+    handle written to a unix socket, preceded by a small layout header.
+
+    The producer (an Android-side renderer) allocates the AHardwareBuffer,
+    writes the layout header followed by the serialized handle
+    (AHardwareBuffer_sendHandleToUnixSocket) into one end of a socketpair,
+    and the client relays the peer end to the compositor, which deserializes
+    the handle. The client process itself never parses or reconstructs the
+    handle, so it needs no Android private libraries.
+
+    The compositor imports the buffer as an EGLImage, so compositing samples
+    the very allocation the producer rendered into, with no copy.
+
+    This is the Android equivalent of zwp_linux_dmabuf_v1: it exists because
+    Android EGL does not expose EGL_EXT_image_dma_buf_import.
+  </description>
+
+  <interface name="zwp_winfusion_buffer_v1" version="1">
+    <description summary="create zero-copy AHardwareBuffer wl_buffers">
+      This global provides a way to create wl_buffer objects backed by
+      AHardwareBuffers shared through a socket. The producer allocates the
+      buffer and the client relays its serialized handle with import_buffer.
+    </description>
+
+    <request name="import_buffer" since="1">
+      <description summary="import a buffer backed by an externally allocated AHardwareBuffer">
+        Creates a wl_buffer from an AHardwareBuffer that was allocated
+        outside of the compositor.
+
+        The request direction is client to compositor, but the client is not
+        the writer of socket_fd. The AHardwareBuffer is allocated and
+        serialized by the Android-side renderer, which creates a socketpair,
+        writes the layout header followed by the serialized handle
+        (AHardwareBuffer_sendHandleToUnixSocket) into one end, and hands the
+        peer end to the client out-of-band. The client only relays that file
+        descriptor here; it never parses or reconstructs the handle, so it
+        does not need Android private libraries.
+
+        The compositor reads the layout header, then recovers the
+        AHardwareBuffer with AHardwareBuffer_recvHandleFromUnixSocket. The
+        header fields must agree with the width, height and format arguments
+        of this request, and the recovered buffer must match the requested
+        geometry and format; otherwise this is a protocol error.
+
+        The format argument is the DRM fourcc of the buffer contents.
+      </description>
+      <arg name="id" type="new_id" interface="wl_buffer"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+      <arg name="format" type="uint"/>
+      <arg name="socket_fd" type="fd" summary="socket carrying the serialized AHardwareBuffer handle"/>
+    </request>
+  </interface>
+</protocol>
