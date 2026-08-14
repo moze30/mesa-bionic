@@ -37,9 +37,11 @@
 #include "drm-uapi/drm_fourcc.h"
 
 #include "vk_instance.h"
+#include "vk_format.h"
 #include "vk_device.h"
 #include "vk_physical_device.h"
 #include "vk_util.h"
+#include "vk_android.h"
 #include "wsi_common_entrypoints.h"
 #include "wsi_common_private.h"
 #include "fifo-v1-client-protocol.h"
@@ -63,6 +65,15 @@
 #include <util/os_file.h>
 
 #include <loader/loader_wayland_helper.h>
+
+#if defined(VK_USE_PLATFORM_ANDROID_KHR) && ANDROID_API_LEVEL >= 26
+#include <android/hardware_buffer.h>
+#include <vndk/hardware_buffer.h>
+#define WSI_WL_HAS_AHB 1
+#else
+#define WSI_WL_HAS_AHB 0
+struct AHardwareBuffer;
+#endif
 
 #ifdef MAJOR_IN_MKDEV
 #include <sys/mkdev.h>
@@ -170,7 +181,7 @@ struct wsi_wl_image {
    void *shm_ptr;
    unsigned shm_size;
 
-   int winfusion_fd;
+   struct AHardwareBuffer *winfusion_ahb;
    uint32_t winfusion_stride;
    uint64_t winfusion_size;
 
@@ -1464,7 +1475,8 @@ registry_handle_global(void *data, struct wl_registry *registry,
                                           &dmabuf_listener, display);
       } else if (strcmp(interface, zwp_winfusion_buffer_v1_interface.name) == 0) {
          display->winfusion_buffer =
-            wl_registry_bind(registry, name, &zwp_winfusion_buffer_v1_interface, 1);
+            wl_registry_bind(registry, name, &zwp_winfusion_buffer_v1_interface,
+                             MIN2(version, 2));
       } else if (strcmp(interface, wp_linux_drm_syncobj_manager_v1_interface.name) == 0) {
          display->wl_syncobj =
             wl_registry_bind(registry, name, &wp_linux_drm_syncobj_manager_v1_interface, 1);
@@ -3603,8 +3615,8 @@ static const struct wl_buffer_listener buffer_listener = {
    buffer_handle_release,
 };
 
+#if WSI_WL_HAS_AHB
 #define WINFUSION_AHB_SOCKET_MAGIC 0x57464148u
-#define WINFUSION_AHB_MAX_FDS 128
 
 struct winfusion_ahb_socket_header {
    uint32_t magic;
@@ -3617,12 +3629,12 @@ struct winfusion_ahb_socket_header {
 };
 
 static bool
-wsi_wl_read_full(int fd, void *data, size_t size)
+wsi_wl_write_full(int fd, const void *data, size_t size)
 {
-   uint8_t *p = data;
+   const uint8_t *p = data;
 
    while (size > 0) {
-      ssize_t ret = read(fd, p, size);
+      ssize_t ret = write(fd, p, size);
       if (ret < 0) {
          if (errno == EINTR)
             continue;
@@ -3637,46 +3649,88 @@ wsi_wl_read_full(int fd, void *data, size_t size)
    return true;
 }
 
-static int
-wsi_wl_recv_ahb_fd(int socket_fd)
+static bool
+wsi_wl_ahb_format_supported(VkFormat format)
 {
-   uint8_t data[4096 * sizeof(int)];
-   char control[CMSG_SPACE(WINFUSION_AHB_MAX_FDS * sizeof(int))];
-   struct iovec iov = {
-      .iov_base = data,
-      .iov_len = sizeof(data),
-   };
-   struct msghdr msg = {
-      .msg_iov = &iov,
-      .msg_iovlen = 1,
-      .msg_control = control,
-      .msg_controllen = sizeof(control),
-   };
-   ssize_t ret;
+   switch (format) {
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_B8G8R8A8_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
 
-   do {
-      ret = recvmsg(socket_fd, &msg, 0);
-   } while (ret < 0 && errno == EINTR);
-   if (ret <= 0 || (msg.msg_flags & MSG_CTRUNC))
-      return -1;
+static bool
+wsi_wl_ahb_image_supported(const struct wsi_device *wsi,
+                           const VkSwapchainCreateInfoKHR *create_info)
+{
+   if (!wsi_wl_ahb_format_supported(create_info->imageFormat))
+      return false;
 
-   int first_fd = -1;
-   for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-        cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-      if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS)
-         continue;
-
-      size_t count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-      int *fds = (int *)CMSG_DATA(cmsg);
-      for (size_t i = 0; i < count; i++) {
-         if (first_fd < 0)
-            first_fd = fds[i];
-         else
-            close(fds[i]);
-      }
+   VkImageCreateFlags flags = VK_IMAGE_CREATE_ALIAS_BIT;
+   if (create_info->flags & VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR)
+      flags |= VK_IMAGE_CREATE_PROTECTED_BIT;
+   if (create_info->flags & VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR)
+      flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+               VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+   if (create_info->flags &
+       VK_SWAPCHAIN_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT) {
+      flags |= VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT;
    }
 
-   return first_fd;
+   const VkImageUsageFlags2KHR usage =
+      vk_swapchain_usage_flags(create_info) | VK_IMAGE_USAGE_SAMPLED_BIT;
+   VkImageUsageFlags2CreateInfoKHR usage_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_USAGE_FLAGS_2_CREATE_INFO_KHR,
+      .usage = usage,
+   };
+   VkPhysicalDeviceExternalImageFormatInfo external_info = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+      .pNext = &usage_info,
+      .handleType =
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
+   };
+
+   VkImageFormatListCreateInfo format_list;
+   if (flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
+      const VkImageFormatListCreateInfo *format_list_in =
+         vk_find_struct_const(create_info->pNext,
+                              IMAGE_FORMAT_LIST_CREATE_INFO);
+      if (!format_list_in)
+         return false;
+
+      format_list = *format_list_in;
+      format_list.pNext = NULL;
+      __vk_append_struct(&external_info, &format_list);
+   }
+
+   const VkPhysicalDeviceImageFormatInfo2 format_info = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+      .pNext = &external_info,
+      .format = create_info->imageFormat,
+      .type = VK_IMAGE_TYPE_2D,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = usage,
+      .flags = flags,
+   };
+   VkExternalImageFormatProperties external_props = {
+      .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+   };
+   VkImageFormatProperties2 format_props = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+      .pNext = &external_props,
+   };
+
+   VkResult result = wsi->GetPhysicalDeviceImageFormatProperties2(
+      wsi->pdevice, &format_info, &format_props);
+   return result == VK_SUCCESS &&
+          create_info->imageExtent.width <=
+             format_props.imageFormatProperties.maxExtent.width &&
+          create_info->imageExtent.height <=
+             format_props.imageFormatProperties.maxExtent.height &&
+          (external_props.externalMemoryProperties.externalMemoryFeatures &
+           VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT);
 }
 
 static VkResult
@@ -3687,51 +3741,73 @@ wsi_wl_create_ahb_image_mem(const struct wsi_swapchain *wsi_chain,
    struct wsi_wl_image *image =
       container_of(base_image, struct wsi_wl_image, base);
    const struct wsi_device *wsi = wsi_chain->wsi;
-   VK_FROM_HANDLE(vk_device, device, wsi_chain->device);
-   VkMemoryRequirements reqs;
-   VkMemoryFdPropertiesKHR fd_props = {
-      .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
+   const struct wsi_memory_allocate_info wsi_info = {
+      .sType = VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA,
+      .implicit_sync = !info->explicit_sync && !wsi_chain->dma_buf_semaphore,
+      .dma_buf_sync_file = wsi_chain->dma_buf_semaphore,
    };
-
-   wsi->GetImageMemoryRequirements(wsi_chain->device, base_image->image, &reqs);
-   VkResult result = device->dispatch_table.GetMemoryFdPropertiesKHR(
-      wsi_chain->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-      image->winfusion_fd, &fd_props);
-   if (result != VK_SUCCESS)
-      return result;
-
-   uint32_t compatible_types = reqs.memoryTypeBits & fd_props.memoryTypeBits;
-   if (!compatible_types)
-      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
-
-   base_image->dma_buf_fd = os_dupfd_cloexec(image->winfusion_fd);
-   if (base_image->dma_buf_fd < 0)
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-
+   const VkExportMemoryAllocateInfo export_info = {
+      .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+      .pNext = &wsi_info,
+      .handleTypes =
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
+   };
    const VkMemoryDedicatedAllocateInfo dedicated_info = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+      .pNext = &export_info,
       .image = base_image->image,
-   };
-   const VkImportMemoryFdInfoKHR import_info = {
-      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
-      .pNext = &dedicated_info,
-      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-      .fd = image->winfusion_fd,
    };
    const VkMemoryAllocateInfo memory_info = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-      .pNext = &import_info,
-      .allocationSize = reqs.size,
-      .memoryTypeIndex = ffs(compatible_types) - 1,
+      .pNext = &dedicated_info,
+      /* AHB image exports are dedicated and derive their allocation from the
+       * image description; allocationSize and memoryTypeIndex are ignored. */
+      .allocationSize = 0,
+      .memoryTypeIndex = 0,
    };
 
-   result = wsi->AllocateMemory(wsi_chain->device, &memory_info,
-                                &wsi_chain->alloc, &base_image->memory);
+   VkResult result = wsi->AllocateMemory(wsi_chain->device, &memory_info,
+                                         &wsi_chain->alloc,
+                                         &base_image->memory);
    if (result != VK_SUCCESS)
       return result;
 
-   image->winfusion_fd = -1;
-   base_image->drm_modifier = DRM_FORMAT_MOD_LINEAR;
+   const VkMemoryGetAndroidHardwareBufferInfoANDROID get_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_GET_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,
+      .memory = base_image->memory,
+   };
+   result = wsi->GetMemoryAndroidHardwareBufferANDROID(
+      wsi_chain->device, &get_info, &image->winfusion_ahb);
+   if (result != VK_SUCCESS)
+      return result;
+
+   const native_handle_t *handle =
+      AHardwareBuffer_getNativeHandle(image->winfusion_ahb);
+   if (!handle || handle->numFds < 1) {
+      AHardwareBuffer_release(image->winfusion_ahb);
+      image->winfusion_ahb = NULL;
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   base_image->dma_buf_fd = os_dupfd_cloexec(handle->data[0]);
+   if (base_image->dma_buf_fd < 0) {
+      AHardwareBuffer_release(image->winfusion_ahb);
+      image->winfusion_ahb = NULL;
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
+   AHardwareBuffer_Desc desc;
+   AHardwareBuffer_describe(image->winfusion_ahb, &desc);
+   image->winfusion_stride =
+      desc.stride * vk_format_get_blocksize(info->create.format);
+   image->winfusion_size =
+      (uint64_t)image->winfusion_stride * desc.height;
+
+   off_t dma_buf_size = lseek(handle->data[0], 0, SEEK_END);
+   if (dma_buf_size > 0)
+      image->winfusion_size = dma_buf_size;
+
+   base_image->drm_modifier = DRM_FORMAT_MOD_INVALID;
    base_image->num_planes = 1;
    base_image->offsets[0] = 0;
    base_image->row_pitches[0] = image->winfusion_stride;
@@ -3740,50 +3816,76 @@ wsi_wl_create_ahb_image_mem(const struct wsi_swapchain *wsi_chain,
 }
 
 static VkResult
-wsi_wl_request_ahb_buffer(struct wsi_wl_swapchain *chain,
-                          struct wsi_wl_image *image)
+wsi_wl_import_ahb_buffer(struct wsi_wl_swapchain *chain,
+                         struct wsi_wl_image *image)
 {
    struct wsi_wl_display *display = chain->wsi_wl_surface->display;
-   struct winfusion_ahb_socket_header header;
+   const struct winfusion_ahb_socket_header header = {
+      .magic = WINFUSION_AHB_SOCKET_MAGIC,
+      .version = 1,
+      .width = chain->extent.width,
+      .height = chain->extent.height,
+      .format = chain->drm_format,
+      .stride = image->winfusion_stride,
+      .size = image->winfusion_size,
+   };
    int sock[2];
 
    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sock) < 0)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
+   if (!wsi_wl_write_full(sock[0], &header, sizeof(header)) ||
+       AHardwareBuffer_sendHandleToUnixSocket(image->winfusion_ahb,
+                                               sock[0]) != 0) {
+      close(sock[0]);
+      close(sock[1]);
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
+   close(sock[0]);
+
    struct wl_buffer *buffer =
-      zwp_winfusion_buffer_v1_create_buffer(display->winfusion_buffer,
+      zwp_winfusion_buffer_v1_import_buffer(display->winfusion_buffer,
                                             chain->extent.width,
                                             chain->extent.height,
-                                            chain->drm_format, sock[1]);
+                                            chain->drm_format,
+                                            sock[1]);
    close(sock[1]);
-   if (!buffer) {
-      close(sock[0]);
+   if (!buffer)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
-   }
 
-   wl_display_flush(display->wl_display);
-   if (!wsi_wl_read_full(sock[0], &header, sizeof(header)) ||
-       header.magic != WINFUSION_AHB_SOCKET_MAGIC || header.version != 1 ||
-       header.width != chain->extent.width ||
-       header.height != chain->extent.height ||
-       header.format != chain->drm_format || header.stride == 0) {
-      close(sock[0]);
-      wl_buffer_destroy(buffer);
-      return VK_ERROR_INITIALIZATION_FAILED;
-   }
-
-   image->winfusion_fd = wsi_wl_recv_ahb_fd(sock[0]);
-   close(sock[0]);
-   if (image->winfusion_fd < 0) {
-      wl_buffer_destroy(buffer);
-      return VK_ERROR_INITIALIZATION_FAILED;
-   }
-
-   image->winfusion_stride = header.stride;
-   image->winfusion_size = header.size;
    loader_wayland_wrap_buffer(&image->wayland_buffer, buffer);
    return VK_SUCCESS;
 }
+
+static void
+wsi_wl_release_ahb(struct wsi_wl_image *image)
+{
+   if (image->winfusion_ahb) {
+      AHardwareBuffer_release(image->winfusion_ahb);
+      image->winfusion_ahb = NULL;
+   }
+}
+#else
+static VkResult
+wsi_wl_create_ahb_image_mem(UNUSED const struct wsi_swapchain *wsi_chain,
+                            UNUSED const struct wsi_image_info *info,
+                            UNUSED struct wsi_image *base_image)
+{
+   return VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
+static VkResult
+wsi_wl_import_ahb_buffer(UNUSED struct wsi_wl_swapchain *chain,
+                         UNUSED struct wsi_wl_image *image)
+{
+   return VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
+static void
+wsi_wl_release_ahb(UNUSED struct wsi_wl_image *image)
+{
+}
+#endif
 
 static uint8_t *
 wsi_wl_alloc_image_shm(struct wsi_image *imagew, unsigned size)
@@ -3811,40 +3913,16 @@ wsi_wl_alloc_image_shm(struct wsi_image *imagew, unsigned size)
 static VkResult
 wsi_wl_image_init(struct wsi_wl_swapchain *chain,
                   struct wsi_wl_image *image,
-                  const VkSwapchainCreateInfoKHR *pCreateInfo,
-                  const VkAllocationCallbacks* pAllocator)
+                  UNUSED const VkSwapchainCreateInfoKHR *pCreateInfo,
+                  UNUSED const VkAllocationCallbacks* pAllocator)
 {
    struct wsi_wl_display *display = chain->wsi_wl_surface->display;
-   struct wsi_image_info image_info;
-   const struct wsi_image_info *create_info = &chain->base.image_info;
-   VkImageDrmFormatModifierExplicitCreateInfoEXT explicit_modifier = {
-      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
-   };
-   VkSubresourceLayout plane_layout = {0};
    VkResult result;
 
-   image->winfusion_fd = -1;
+   image->winfusion_ahb = NULL;
 
-   if (chain->buffer_type == WSI_WL_BUFFER_AHB) {
-      result = wsi_wl_request_ahb_buffer(chain, image);
-      if (result != VK_SUCCESS)
-         return result;
-
-      image_info = chain->base.image_info;
-      plane_layout.offset = 0;
-      plane_layout.size = image->winfusion_size;
-      plane_layout.rowPitch = image->winfusion_stride;
-      explicit_modifier.pNext = image_info.create.pNext;
-      explicit_modifier.drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
-      explicit_modifier.drmFormatModifierPlaneCount = 1;
-      explicit_modifier.pPlaneLayouts = &plane_layout;
-      image_info.create.pNext = &explicit_modifier;
-      image_info.create.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
-      image_info.create_mem = wsi_wl_create_ahb_image_mem;
-      create_info = &image_info;
-   }
-
-   result = wsi_create_image(&chain->base, create_info, &image->base);
+   result = wsi_create_image(&chain->base, &chain->base.image_info,
+                             &image->base);
    if (result != VK_SUCCESS)
       goto fail_buffer;
 
@@ -3913,7 +3991,9 @@ wsi_wl_image_init(struct wsi_wl_swapchain *chain,
    }
 
    case WSI_WL_BUFFER_AHB:
-      assert(image->wayland_buffer.buffer);
+      result = wsi_wl_import_ahb_buffer(chain, image);
+      if (result != VK_SUCCESS)
+         goto fail_image;
       break;
 
    default:
@@ -3930,19 +4010,14 @@ wsi_wl_image_init(struct wsi_wl_swapchain *chain,
    return VK_SUCCESS;
 
 fail_image:
-   for (uint32_t i = 0; i < WSI_ES_COUNT; i++) {
-      if (image->wl_syncobj_timeline[i])
-         wp_linux_drm_syncobj_timeline_v1_destroy(image->wl_syncobj_timeline[i]);
-   }
-   wsi_destroy_image(&chain->base, &image->base);
-
-   return VK_ERROR_OUT_OF_HOST_MEMORY;
+   /* The swapchain failure path owns cleanup for an image that was created
+    * successfully but failed while creating its Wayland-side resources. */
+   return result == VK_SUCCESS ? VK_ERROR_OUT_OF_HOST_MEMORY : result;
 
 fail_buffer:
-   if (image->winfusion_fd >= 0)
-      close(image->winfusion_fd);
-   if (image->wayland_buffer.buffer)
-      loader_wayland_buffer_destroy(&image->wayland_buffer);
+   /* wsi_create_image() already destroyed any partial Vulkan resources. */
+   memset(&image->base, 0, sizeof(image->base));
+   wsi_wl_release_ahb(image);
    return result;
 }
 
@@ -3954,13 +4029,18 @@ wsi_wl_swapchain_images_free(struct wsi_wl_swapchain *chain)
          if (chain->images[i].wl_syncobj_timeline[j])
             wp_linux_drm_syncobj_timeline_v1_destroy(chain->images[i].wl_syncobj_timeline[j]);
       }
-      if (chain->images[i].wayland_buffer.buffer) {
+      if (chain->images[i].wayland_buffer.buffer)
          loader_wayland_buffer_destroy(&chain->images[i].wayland_buffer);
+
+      if (chain->images[i].base.image != VK_NULL_HANDLE ||
+          chain->images[i].base.memory != VK_NULL_HANDLE) {
          wsi_destroy_image(&chain->base, &chain->images[i].base);
-         if (chain->images[i].shm_size) {
-            close(chain->images[i].shm_fd);
-            munmap(chain->images[i].shm_ptr, chain->images[i].shm_size);
-         }
+      }
+      wsi_wl_release_ahb(&chain->images[i]);
+
+      if (chain->images[i].shm_size) {
+         close(chain->images[i].shm_fd);
+         munmap(chain->images[i].shm_ptr, chain->images[i].shm_size);
       }
    }
 }
@@ -4176,21 +4256,33 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    struct wsi_base_image_params *image_params = NULL;
    struct wsi_cpu_image_params cpu_image_params;
    struct wsi_drm_image_params drm_image_params;
+   struct wsi_ahb_image_params ahb_image_params;
    uint32_t num_drm_modifiers = 0;
    const uint64_t *drm_modifiers = NULL;
    bool use_shm = !wsi_wl_surface->display->wl_dmabuf &&
                   wsi_wl_surface->display->wl_shm;
-   if (wsi_wl_surface->display->winfusion_buffer && !wsi_device->sw) {
-      /* The compositor allocates the AHardwareBuffer and the client imports
-       * its dma-buf into Vulkan through the private protocol. */
-      drm_image_params = (struct wsi_drm_image_params) {
-         .base.image_type = WSI_IMAGE_TYPE_DRM,
-         .same_gpu = true,
-         /* Fenced releases are not wired up on this path yet. */
-         .explicit_sync = false,
+
+   bool use_winfusion_ahb = false;
+#if WSI_WL_HAS_AHB
+   if (wsi_wl_surface->display->winfusion_buffer) {
+      const uint32_t version = wl_proxy_get_version(
+         (struct wl_proxy *)wsi_wl_surface->display->winfusion_buffer);
+      use_winfusion_ahb =
+         version >= ZWP_WINFUSION_BUFFER_V1_IMPORT_BUFFER_SINCE_VERSION &&
+         !wsi_device->sw &&
+         wsi_device->has_android_hardware_buffer &&
+         wsi_device->GetMemoryAndroidHardwareBufferANDROID != NULL &&
+         wsi_wl_ahb_image_supported(wsi_device, pCreateInfo);
+   }
+#endif
+
+   if (use_winfusion_ahb) {
+      ahb_image_params = (struct wsi_ahb_image_params) {
+         .base.image_type = WSI_IMAGE_TYPE_AHB,
+         .create_mem = wsi_wl_create_ahb_image_mem,
       };
       buffer_type = WSI_WL_BUFFER_AHB;
-      image_params = &drm_image_params.base;
+      image_params = &ahb_image_params.base;
    } else if (wsi_device->sw || use_shm) {
       cpu_image_params = (struct wsi_cpu_image_params) {
          .base.image_type = WSI_IMAGE_TYPE_CPU,
@@ -4397,6 +4489,12 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       if (result != VK_SUCCESS)
          goto fail_free_wl_images;
       chain->images[i].busy = false;
+   }
+
+   if (buffer_type == WSI_WL_BUFFER_AHB &&
+       wl_display_roundtrip_queue(dpy->wl_display, dpy->queue) < 0) {
+      result = VK_ERROR_SURFACE_LOST_KHR;
+      goto fail_free_wl_images;
    }
 
    chain->present_ids.valid_refresh_nsec = false;

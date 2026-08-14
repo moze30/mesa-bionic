@@ -38,6 +38,13 @@ AHardwareBuffer_isSupported(const AHardwareBuffer_Desc* desc)
    return 0;
 }
 
+int
+AHardwareBuffer_sendHandleToUnixSocket(const AHardwareBuffer *buffer,
+                                       int socket_fd)
+{
+   return -1;
+}
+
 const native_handle_t *
 AHardwareBuffer_getNativeHandle(const AHardwareBuffer *buffer)
 {

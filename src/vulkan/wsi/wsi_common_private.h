@@ -33,6 +33,7 @@ extern "C" {
 #endif
 
 struct wsi_image;
+struct wsi_image_info;
 struct wsi_swapchain;
 
 #define WSI_DEBUG_BUFFER      (1ull << 0)
@@ -47,6 +48,7 @@ extern uint64_t WSI_DEBUG;
 enum wsi_image_type {
    WSI_IMAGE_TYPE_CPU,
    WSI_IMAGE_TYPE_DRM,
+   WSI_IMAGE_TYPE_AHB,
    WSI_IMAGE_TYPE_DXGI,
    WSI_IMAGE_TYPE_METAL,
 };
@@ -71,6 +73,14 @@ struct wsi_drm_image_params {
    uint32_t num_modifier_lists;
    const uint32_t *num_modifiers;
    const uint64_t *const *modifiers;
+};
+
+struct wsi_ahb_image_params {
+   struct wsi_base_image_params base;
+
+   VkResult (*create_mem)(const struct wsi_swapchain *chain,
+                          const struct wsi_image_info *info,
+                          struct wsi_image *image);
 };
 
 struct wsi_dxgi_image_params {
