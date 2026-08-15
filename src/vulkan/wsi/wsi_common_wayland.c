@@ -3781,21 +3781,6 @@ wsi_wl_create_ahb_image_mem(const struct wsi_swapchain *wsi_chain,
    if (result != VK_SUCCESS)
       return result;
 
-   const native_handle_t *handle =
-      AHardwareBuffer_getNativeHandle(image->winfusion_ahb);
-   if (!handle || handle->numFds < 1) {
-      AHardwareBuffer_release(image->winfusion_ahb);
-      image->winfusion_ahb = NULL;
-      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
-   }
-
-   base_image->dma_buf_fd = os_dupfd_cloexec(handle->data[0]);
-   if (base_image->dma_buf_fd < 0) {
-      AHardwareBuffer_release(image->winfusion_ahb);
-      image->winfusion_ahb = NULL;
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-   }
-
    AHardwareBuffer_Desc desc;
    AHardwareBuffer_describe(image->winfusion_ahb, &desc);
    image->winfusion_stride =
@@ -3803,9 +3788,28 @@ wsi_wl_create_ahb_image_mem(const struct wsi_swapchain *wsi_chain,
    image->winfusion_size =
       (uint64_t)image->winfusion_stride * desc.height;
 
-   off_t dma_buf_size = lseek(handle->data[0], 0, SEEK_END);
-   if (dma_buf_size > 0)
-      image->winfusion_size = dma_buf_size;
+   /* Explicit sync does not use the dma-buf's implicit fence state.  Avoid
+    * keeping an otherwise unused fd per image on that path. */
+   if (!info->explicit_sync) {
+      const native_handle_t *handle =
+         AHardwareBuffer_getNativeHandle(image->winfusion_ahb);
+      if (!handle || handle->numFds < 1) {
+         AHardwareBuffer_release(image->winfusion_ahb);
+         image->winfusion_ahb = NULL;
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      }
+
+      base_image->dma_buf_fd = os_dupfd_cloexec(handle->data[0]);
+      if (base_image->dma_buf_fd < 0) {
+         AHardwareBuffer_release(image->winfusion_ahb);
+         image->winfusion_ahb = NULL;
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+
+      off_t dma_buf_size = lseek(handle->data[0], 0, SEEK_END);
+      if (dma_buf_size > 0)
+         image->winfusion_size = dma_buf_size;
+   }
 
    base_image->drm_modifier = DRM_FORMAT_MOD_INVALID;
    base_image->num_planes = 1;
@@ -3886,6 +3890,25 @@ wsi_wl_release_ahb(UNUSED struct wsi_wl_image *image)
 {
 }
 #endif
+
+static VkResult
+wsi_wl_import_image_syncobj_timelines(struct wsi_wl_display *display,
+                                      struct wsi_wl_swapchain *chain,
+                                      struct wsi_wl_image *image)
+{
+   if (!chain->base.image_info.explicit_sync)
+      return VK_SUCCESS;
+
+   for (uint32_t i = 0; i < WSI_ES_COUNT; i++) {
+      image->wl_syncobj_timeline[i] =
+         wp_linux_drm_syncobj_manager_v1_import_timeline(
+            display->wl_syncobj, image->base.explicit_sync[i].fd);
+      if (!image->wl_syncobj_timeline[i])
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
+   return VK_SUCCESS;
+}
 
 static uint8_t *
 wsi_wl_alloc_image_shm(struct wsi_image *imagew, unsigned size)
@@ -3977,21 +4000,19 @@ wsi_wl_image_init(struct wsi_wl_swapchain *chain,
       zwp_linux_buffer_params_v1_destroy(params);
       loader_wayland_wrap_buffer(&image->wayland_buffer, buffer);
 
-      if (chain->base.image_info.explicit_sync) {
-         for (uint32_t i = 0; i < WSI_ES_COUNT; i++) {
-            image->wl_syncobj_timeline[i] =
-               wp_linux_drm_syncobj_manager_v1_import_timeline(display->wl_syncobj,
-                                                               image->base.explicit_sync[i].fd);
-            if (!image->wl_syncobj_timeline[i])
-               goto fail_image;
-         }
-      }
+      result = wsi_wl_import_image_syncobj_timelines(display, chain, image);
+      if (result != VK_SUCCESS)
+         goto fail_image;
 
       break;
    }
 
    case WSI_WL_BUFFER_AHB:
       result = wsi_wl_import_ahb_buffer(chain, image);
+      if (result != VK_SUCCESS)
+         goto fail_image;
+
+      result = wsi_wl_import_image_syncobj_timelines(display, chain, image);
       if (result != VK_SUCCESS)
          goto fail_image;
       break;
@@ -4279,6 +4300,8 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    if (use_winfusion_ahb) {
       ahb_image_params = (struct wsi_ahb_image_params) {
          .base.image_type = WSI_IMAGE_TYPE_AHB,
+         .explicit_sync = wsi_wl_use_explicit_sync(wsi_wl_surface->display,
+                                                    wsi_device),
          .create_mem = wsi_wl_create_ahb_image_mem,
       };
       buffer_type = WSI_WL_BUFFER_AHB;

@@ -78,6 +78,10 @@ struct wsi_drm_image_params {
 struct wsi_ahb_image_params {
    struct wsi_base_image_params base;
 
+   /* Whether the window system can synchronize the AHB with syncobj
+    * acquire/release points instead of dma-buf implicit fences. */
+   bool explicit_sync;
+
    VkResult (*create_mem)(const struct wsi_swapchain *chain,
                           const struct wsi_image_info *info,
                           struct wsi_image *image);
