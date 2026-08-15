@@ -24,22 +24,37 @@
   </copyright>
 
   <description summary="zero-copy AHardwareBuffer buffers for WinFusion">
-    WinFusion private protocol for compositor-allocated AHardwareBuffers.
+    WinFusion private protocol for sharing AHardwareBuffers with the
+    compositor. A buffer is always transferred as a serialized
+    AHardwareBuffer handle written to a unix socket, preceded by a small
+    layout header. Both allocation directions are supported:
 
-    The compositor allocates the AHardwareBuffer, sends its handle through the
-    socket supplied by the client, and imports the same buffer as an EGLImage.
-    The client imports the received dma-buf into Vulkan, so both sides use the
-    same gralloc allocation without loading Android private libraries in the
-    client process.
+    - create_buffer: the compositor allocates the AHardwareBuffer and writes
+      its handle into the socket supplied by the client.
+
+    - import_buffer (since version 2): an Android-side process allocates the
+      AHardwareBuffer, writes its handle into a socketpair, and the client
+      relays the peer end of that socketpair to the compositor, which
+      deserializes the handle.
+
+    In both cases the client process itself never has to load Android private
+    libraries: it either consumes the dma-buf fds of the handle, or it merely
+    forwards a socket file descriptor it received out-of-band.
+
+    Either way the compositor ends up importing the buffer as an EGLImage, so
+    compositing samples the very gralloc allocation the producer rendered
+    into.
 
     This is the Android equivalent of zwp_linux_dmabuf_v1: it exists because
     Android EGL does not expose EGL_EXT_image_dma_buf_import.
   </description>
 
-  <interface name="zwp_winfusion_buffer_v1" version="1">
+  <interface name="zwp_winfusion_buffer_v1" version="2">
     <description summary="create zero-copy AHardwareBuffer wl_buffers">
       This global provides a way to create wl_buffer objects backed by
-      AHardwareBuffers allocated by the compositor and shared through a socket.
+      AHardwareBuffers shared through a socket, either allocated by the
+      compositor (create_buffer) or by an Android-side producer
+      (import_buffer).
     </description>
 
     <request name="create_buffer">
@@ -59,6 +74,35 @@
       <arg name="height" type="int"/>
       <arg name="format" type="uint"/>
       <arg name="socket_fd" type="fd" summary="socket used for the server reply"/>
+    </request>
+
+    <request name="import_buffer" since="2">
+      <description summary="import a buffer backed by an externally allocated AHardwareBuffer">
+        Creates a wl_buffer from an AHardwareBuffer that was allocated
+        outside of the compositor.
+
+        The request direction is client to compositor, but the client is not
+        the writer of socket_fd. The AHardwareBuffer is allocated and
+        serialized by the Android-side renderer, which creates a socketpair,
+        writes the layout header followed by the serialized handle
+        (AHardwareBuffer_sendHandleToUnixSocket) into one end, and hands the
+        peer end to the client out-of-band. The client only relays that file
+        descriptor here; it never parses or reconstructs the handle, so it
+        does not need Android private libraries.
+
+        The compositor reads the layout header, then recovers the
+        AHardwareBuffer with AHardwareBuffer_recvHandleFromUnixSocket. The
+        header fields must agree with the width, height and format arguments
+        of this request, and the recovered buffer must match the requested
+        geometry and format; otherwise this is a protocol error.
+
+        The format argument is the DRM fourcc of the buffer contents.
+      </description>
+      <arg name="id" type="new_id" interface="wl_buffer"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+      <arg name="format" type="uint"/>
+      <arg name="socket_fd" type="fd" summary="socket carrying the serialized AHardwareBuffer handle"/>
     </request>
   </interface>
 </protocol>

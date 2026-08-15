@@ -92,7 +92,8 @@ tu_bo_init_dmabuf(struct tu_device *dev,
                   enum tu_bo_alloc_flags flags,
                   int fd)
 {
-   assert(!(flags & ~TU_BO_ALLOC_REPLAYABLE));
+   assert(!(flags & ~(TU_BO_ALLOC_REPLAYABLE |
+                      TU_BO_ALLOC_IMPLICIT_SYNC)));
    size = align64(size, os_page_size);
    VkResult result = dev->instance->knl->bo_init_dmabuf(dev, bo, size, flags, fd);
    if (result != VK_SUCCESS)

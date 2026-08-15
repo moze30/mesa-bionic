@@ -3681,6 +3681,11 @@ tu_AllocateMemory(VkDevice _device,
       alloc_flags |= TU_BO_ALLOC_REPLAYABLE;
    }
 
+   const struct wsi_memory_allocate_info *wsi_info =
+      vk_find_struct_const(pAllocateInfo->pNext, WSI_MEMORY_ALLOCATE_INFO_MESA);
+   if (wsi_info && wsi_info->implicit_sync)
+      alloc_flags |= TU_BO_ALLOC_IMPLICIT_SYNC;
+
    const VkImportMemoryFdInfoKHR *fd_info =
       vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
 
@@ -3729,11 +3734,6 @@ tu_AllocateMemory(VkDevice _device,
                           (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
                            VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)))
          alloc_flags |= TU_BO_ALLOC_SHAREABLE;
-
-      const struct wsi_memory_allocate_info *wsi_info =
-         vk_find_struct_const(pAllocateInfo->pNext, WSI_MEMORY_ALLOCATE_INFO_MESA);
-      if (wsi_info && wsi_info->implicit_sync)
-         alloc_flags |= TU_BO_ALLOC_IMPLICIT_SYNC;
 
       char name[64] = "vkAllocateMemory()";
       if (device->bo_sizes)

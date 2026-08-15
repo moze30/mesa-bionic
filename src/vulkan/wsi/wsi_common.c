@@ -179,6 +179,10 @@ wsi_device_init(struct wsi_device *wsi,
       supported_extensions->KHR_timeline_semaphore;
    wsi->has_host_query_reset =
       supported_extensions->EXT_host_query_reset;
+#if defined(VK_USE_PLATFORM_ANDROID_KHR) && ANDROID_API_LEVEL >= 26
+   wsi->has_android_hardware_buffer =
+      supported_extensions->ANDROID_external_memory_android_hardware_buffer;
+#endif
 
    /* We cannot expose KHR_present_wait without timeline semaphores. */
    assert(!wsi->has_present_wait || wsi->has_timeline_semaphore);
@@ -220,6 +224,10 @@ wsi_device_init(struct wsi_device *wsi,
    WSI_GET_CB(GetImageSubresourceLayout);
    if (!wsi->sw)
       WSI_GET_CB(GetMemoryFdKHR);
+#if defined(VK_USE_PLATFORM_ANDROID_KHR) && ANDROID_API_LEVEL >= 26
+   if (wsi->has_android_hardware_buffer)
+      WSI_GET_CB(GetMemoryAndroidHardwareBufferANDROID);
+#endif
    WSI_GET_CB(GetPhysicalDeviceCalibrateableTimeDomainsKHR);
    WSI_GET_CB(GetPhysicalDeviceProperties);
    WSI_GET_CB(GetPhysicalDeviceFormatProperties);
@@ -416,6 +424,8 @@ get_blit_type(const struct wsi_device *wsi,
          WSI_SWAPCHAIN_BUFFER_BLIT : WSI_SWAPCHAIN_NO_BLIT;
    }
 #endif
+   case WSI_IMAGE_TYPE_AHB:
+      return WSI_SWAPCHAIN_NO_BLIT;
 #ifdef _WIN32
    case WSI_IMAGE_TYPE_DXGI: {
       const struct wsi_dxgi_image_params *dxgi_params =
@@ -465,6 +475,24 @@ configure_image(const struct wsi_swapchain *chain,
       return wsi_drm_configure_image(chain, pCreateInfo, drm_params, info);
    }
 #endif
+   case WSI_IMAGE_TYPE_AHB: {
+      const struct wsi_ahb_image_params *ahb_params =
+         container_of(params, const struct wsi_ahb_image_params, base);
+      VkResult result = wsi_configure_image(
+         chain, pCreateInfo,
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
+         info);
+      if (result != VK_SUCCESS)
+         return result;
+
+      info->image_type = WSI_IMAGE_TYPE_AHB;
+      info->explicit_sync = false;
+      info->wsi.scanout = true;
+      info->create.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+      info->usage2.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+      info->create_mem = ahb_params->create_mem;
+      return VK_SUCCESS;
+   }
 #ifdef _WIN32
    case WSI_IMAGE_TYPE_DXGI: {
       const struct wsi_dxgi_image_params *dxgi_params =
@@ -573,7 +601,8 @@ wsi_swapchain_init(const struct wsi_device *wsi,
       goto fail;
 
 #ifdef HAVE_LIBDRM
-   if (chain->image_info.image_type == WSI_IMAGE_TYPE_DRM) {
+   if (chain->image_info.image_type == WSI_IMAGE_TYPE_DRM ||
+       chain->image_info.image_type == WSI_IMAGE_TYPE_AHB) {
       result = wsi_drm_init_swapchain_implicit_sync(chain);
       if (result != VK_SUCCESS)
          goto fail;
