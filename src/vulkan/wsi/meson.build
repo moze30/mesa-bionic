@@ -25,6 +25,7 @@ if with_platform_wayland
   links_vulkan_wsi += libloader_wayland_helper
   files_vulkan_wsi += wp_files['linux-drm-syncobj-v1']
   files_vulkan_wsi += wp_files['color-management-v1']
+  files_vulkan_wsi += files('winfusion-protocol/winfusion-buffer-v1-protocol.c')
 endif
 
 if with_platform_windows
