@@ -24,7 +24,9 @@ if with_platform_wayland
   files_vulkan_wsi += wp_files['tearing-control-v1']
   links_vulkan_wsi += libloader_wayland_helper
   files_vulkan_wsi += wp_files['linux-drm-syncobj-v1']
+  files_vulkan_wsi += wp_files['linux-explicit-synchronization-unstable-v1']
   files_vulkan_wsi += wp_files['color-management-v1']
+  files_vulkan_wsi += files('winfusion-protocol/winfusion-buffer-v1-protocol.c')
 endif
 
 if with_platform_windows
@@ -38,7 +40,8 @@ if with_platform_macos
   files_vulkan_wsi += files('wsi_common_metal.c', 'wsi_common_metal_layer.m')
 endif
 
-if system_has_kms_drm and not with_platform_android
+if system_has_kms_drm and not with_platform_android and \
+   cc.has_function('pthread_cancel', dependencies : dep_thread)
   files_vulkan_wsi += files('wsi_common_display.c')
 endif
 

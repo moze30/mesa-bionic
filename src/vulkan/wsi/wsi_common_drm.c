@@ -392,6 +392,65 @@ wsi_drm_init_swapchain_implicit_sync(struct wsi_swapchain *chain)
                                       &chain->dma_buf_semaphore);
 }
 
+/**
+ * Same as wsi_drm_init_swapchain_implicit_sync(), but probes a caller-provided
+ * dma-buf instead of a driver-allocated one.
+ *
+ * For AHardwareBuffer swapchains the presented dma-buf comes from gralloc, not
+ * from the Vulkan driver.  The generic self-check allocates and exports a
+ * driver BO, so a driver that can import a foreign dma-buf but cannot export
+ * its own memory (KGSL) fails that check and loses kernel-side implicit sync
+ * entirely.  Probing the buffer that the compositor will actually sample is
+ * the only way to tell whether sync-file import works for this swapchain.
+ */
+VkResult
+wsi_drm_init_ahb_implicit_sync(struct wsi_swapchain *chain, int dma_buf_fd,
+                               bool have_explicit_sync)
+{
+   if (chain->image_info.explicit_sync ||
+       chain->dma_buf_semaphore != VK_NULL_HANDLE)
+      return VK_SUCCESS;
+
+   if (!(chain->wsi->semaphore_export_handle_types &
+         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT))
+      return VK_SUCCESS;
+
+   /* Prefer kernel dma-buf implicit sync when the buffer supports it. */
+   bool dma_buf_ok = false;
+   if (dma_buf_fd >= 0) {
+      int sync_file = -1;
+      VkResult result = wsi_dma_buf_export_sync_file(dma_buf_fd, &sync_file);
+      if (result == VK_SUCCESS) {
+         result = wsi_dma_buf_import_sync_file(dma_buf_fd, sync_file);
+         close(sync_file);
+         dma_buf_ok = result == VK_SUCCESS;
+      }
+   }
+
+   if (!dma_buf_ok && !have_explicit_sync)
+      return VK_SUCCESS;
+
+   const VkExportSemaphoreCreateInfo export_info = {
+      .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+      .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+   };
+   const VkSemaphoreCreateInfo semaphore_info = {
+      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+      .pNext = &export_info,
+   };
+   VkResult result = chain->wsi->CreateSemaphore(chain->device, &semaphore_info,
+                                                 &chain->alloc,
+                                                 &chain->dma_buf_semaphore);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* Without dma-buf implicit sync the window system has to wait on the
+    * client's fence, which the backend does by exporting this semaphore as a
+    * sync file and handing it over as an acquire fence. */
+   chain->semaphore_as_acquire_fence = !dma_buf_ok;
+   return VK_SUCCESS;
+}
+
 static VkResult
 wsi_create_sync_imm(struct vk_device *device, struct vk_sync **sync_out)
 {

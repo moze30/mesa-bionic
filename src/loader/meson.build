@@ -11,6 +11,7 @@ if with_platform_wayland
     'presentation-time': mod_wl.find_protocol('presentation-time'),
     'tearing-control-v1': mod_wl.find_protocol('tearing-control', state : 'staging', version : 1),
     'linux-drm-syncobj-v1': mod_wl.find_protocol('linux-drm-syncobj', state : 'staging', version : 1),
+    'linux-explicit-synchronization-unstable-v1': mod_wl.find_protocol('linux-explicit-synchronization', state : 'unstable', version : 1),
     'color-management-v1': mod_wl.find_protocol('color-management', state : 'staging', version : 1)
   }
   wp_files = {}
