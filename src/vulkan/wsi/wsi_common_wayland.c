@@ -236,6 +236,8 @@ struct wsi_wl_swapchain {
    struct wp_linux_drm_syncobj_surface_v1 *wl_syncobj_surface;
 
    struct wl_callback *frame;
+   /* Completion barrier for asynchronous AHB import requests. */
+   struct wl_callback *ahb_import_callback;
 
    /* Deferred present state. For the wl_shm path the CPU must wait for the
     * app's rendering (and our blit) to land in host memory before it can copy
@@ -3110,6 +3112,21 @@ static const struct wl_callback_listener pres_frame_listener = {
 };
 
 static void
+wsi_wl_ahb_import_done(void *data, struct wl_callback *callback,
+                       UNUSED uint32_t serial)
+{
+   struct wsi_wl_swapchain *chain = data;
+
+   if (chain->ahb_import_callback == callback)
+      chain->ahb_import_callback = NULL;
+   wl_callback_destroy(callback);
+}
+
+static const struct wl_callback_listener ahb_import_listener = {
+   .done = wsi_wl_ahb_import_done,
+};
+
+static void
 frame_handle_done(void *data, struct wl_callback *callback, uint32_t serial)
 {
    struct wsi_wl_swapchain *chain = data;
@@ -3265,11 +3282,26 @@ wsi_wl_swapchain_present_now(struct wsi_swapchain *wsi_chain,
    MESA_TRACE_FUNC_FLOW(&chain->images[image_index].wayland_buffer.flow);
 
    /* In case we're sending presentation feedback requests, make sure the
-    * queue their events are in is dispatched.
+    * queue containing their events is dispatched.  AHB swapchains using the
+    * linux-drm-syncobj protocol do not need to poll this queue for the common
+    * present_id == 0 case: no feedback object was queued, and the acquire /
+    * release points are shared kernel timelines rather than Wayland events.
+    * Avoiding the lock + poll on every direct present noticeably reduces the
+    * CPU cost of high-FPS immediate presents.  Keep dispatching as soon as a
+    * previous feedback request is outstanding (or for all other buffer
+    * types), since those callbacks still need to make forward progress.
     */
-   struct timespec instant = {0};
-   if (dispatch_present_id_queue(wsi_chain, &instant) == VK_ERROR_OUT_OF_DATE_KHR)
-      return VK_ERROR_OUT_OF_DATE_KHR;
+   bool dispatch_present_queue = true;
+   if (chain->buffer_type == WSI_WL_BUFFER_AHB) {
+      mtx_lock(&chain->present_ids.lock);
+      dispatch_present_queue = chain->present_ids.outstanding_count != 0;
+      mtx_unlock(&chain->present_ids.lock);
+   }
+   if (dispatch_present_queue) {
+      struct timespec instant = {0};
+      if (dispatch_present_id_queue(wsi_chain, &instant) == VK_ERROR_OUT_OF_DATE_KHR)
+         return VK_ERROR_OUT_OF_DATE_KHR;
+   }
 
    /* While the specification suggests we can keep presenting already acquired
     * images on a retired swapchain, there is no requirement to support that.
@@ -3482,7 +3514,17 @@ wsi_wl_swapchain_present_now(struct wsi_swapchain *wsi_chain,
    wl_surface_commit(wsi_wl_surface->wayland_surface.wrapper);
    wl_display_flush(wsi_wl_surface->display->wl_display);
 
-   if (!queue_dispatched && wsi_chain->image_info.explicit_sync) {
+   /* With AHB direct scanout the compositor consumes the imported syncobj
+    * timelines directly.  Once the one-shot import barrier has completed,
+    * there is no release event to drain from the client queue, so
+    * dispatch_queue_pending() would only add per-frame event work.  Keep it
+    * enabled while the import barrier is outstanding so its callback (and any
+    * protocol error) is observed promptly.  Native dma-buf explicit sync keeps
+    * the old behavior because it may still have protocol events to process. */
+   if (!queue_dispatched &&
+       ((wsi_chain->image_info.explicit_sync &&
+         chain->buffer_type != WSI_WL_BUFFER_AHB) ||
+        chain->ahb_import_callback != NULL)) {
       wl_display_dispatch_queue_pending(wsi_wl_surface->display->wl_display,
                                         wsi_wl_surface->display->queue);
    }
@@ -3781,21 +3823,6 @@ wsi_wl_create_ahb_image_mem(const struct wsi_swapchain *wsi_chain,
    if (result != VK_SUCCESS)
       return result;
 
-   const native_handle_t *handle =
-      AHardwareBuffer_getNativeHandle(image->winfusion_ahb);
-   if (!handle || handle->numFds < 1) {
-      AHardwareBuffer_release(image->winfusion_ahb);
-      image->winfusion_ahb = NULL;
-      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
-   }
-
-   base_image->dma_buf_fd = os_dupfd_cloexec(handle->data[0]);
-   if (base_image->dma_buf_fd < 0) {
-      AHardwareBuffer_release(image->winfusion_ahb);
-      image->winfusion_ahb = NULL;
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-   }
-
    AHardwareBuffer_Desc desc;
    AHardwareBuffer_describe(image->winfusion_ahb, &desc);
    image->winfusion_stride =
@@ -3803,9 +3830,28 @@ wsi_wl_create_ahb_image_mem(const struct wsi_swapchain *wsi_chain,
    image->winfusion_size =
       (uint64_t)image->winfusion_stride * desc.height;
 
-   off_t dma_buf_size = lseek(handle->data[0], 0, SEEK_END);
-   if (dma_buf_size > 0)
-      image->winfusion_size = dma_buf_size;
+   /* Explicit sync does not use the dma-buf's implicit fence state.  Avoid
+    * keeping an otherwise unused fd per image on that path. */
+   if (!info->explicit_sync) {
+      const native_handle_t *handle =
+         AHardwareBuffer_getNativeHandle(image->winfusion_ahb);
+      if (!handle || handle->numFds < 1) {
+         AHardwareBuffer_release(image->winfusion_ahb);
+         image->winfusion_ahb = NULL;
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      }
+
+      base_image->dma_buf_fd = os_dupfd_cloexec(handle->data[0]);
+      if (base_image->dma_buf_fd < 0) {
+         AHardwareBuffer_release(image->winfusion_ahb);
+         image->winfusion_ahb = NULL;
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+
+      off_t dma_buf_size = lseek(handle->data[0], 0, SEEK_END);
+      if (dma_buf_size > 0)
+         image->winfusion_size = dma_buf_size;
+   }
 
    base_image->drm_modifier = DRM_FORMAT_MOD_INVALID;
    base_image->num_planes = 1;
@@ -3886,6 +3932,25 @@ wsi_wl_release_ahb(UNUSED struct wsi_wl_image *image)
 {
 }
 #endif
+
+static VkResult
+wsi_wl_import_image_syncobj_timelines(struct wsi_wl_display *display,
+                                      struct wsi_wl_swapchain *chain,
+                                      struct wsi_wl_image *image)
+{
+   if (!chain->base.image_info.explicit_sync)
+      return VK_SUCCESS;
+
+   for (uint32_t i = 0; i < WSI_ES_COUNT; i++) {
+      image->wl_syncobj_timeline[i] =
+         wp_linux_drm_syncobj_manager_v1_import_timeline(
+            display->wl_syncobj, image->base.explicit_sync[i].fd);
+      if (!image->wl_syncobj_timeline[i])
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
+   return VK_SUCCESS;
+}
 
 static uint8_t *
 wsi_wl_alloc_image_shm(struct wsi_image *imagew, unsigned size)
@@ -3977,21 +4042,19 @@ wsi_wl_image_init(struct wsi_wl_swapchain *chain,
       zwp_linux_buffer_params_v1_destroy(params);
       loader_wayland_wrap_buffer(&image->wayland_buffer, buffer);
 
-      if (chain->base.image_info.explicit_sync) {
-         for (uint32_t i = 0; i < WSI_ES_COUNT; i++) {
-            image->wl_syncobj_timeline[i] =
-               wp_linux_drm_syncobj_manager_v1_import_timeline(display->wl_syncobj,
-                                                               image->base.explicit_sync[i].fd);
-            if (!image->wl_syncobj_timeline[i])
-               goto fail_image;
-         }
-      }
+      result = wsi_wl_import_image_syncobj_timelines(display, chain, image);
+      if (result != VK_SUCCESS)
+         goto fail_image;
 
       break;
    }
 
    case WSI_WL_BUFFER_AHB:
       result = wsi_wl_import_ahb_buffer(chain, image);
+      if (result != VK_SUCCESS)
+         goto fail_image;
+
+      result = wsi_wl_import_image_syncobj_timelines(display, chain, image);
       if (result != VK_SUCCESS)
          goto fail_image;
       break;
@@ -4060,6 +4123,8 @@ wsi_wl_swapchain_chain_free(struct wsi_wl_swapchain *chain,
 
    if (chain->frame)
       wl_callback_destroy(chain->frame);
+   if (chain->ahb_import_callback)
+      wl_callback_destroy(chain->ahb_import_callback);
    if (chain->tearing_control)
       wp_tearing_control_v1_destroy(chain->tearing_control);
    if (chain->wl_syncobj_surface)
@@ -4279,6 +4344,8 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    if (use_winfusion_ahb) {
       ahb_image_params = (struct wsi_ahb_image_params) {
          .base.image_type = WSI_IMAGE_TYPE_AHB,
+         .explicit_sync = wsi_wl_use_explicit_sync(wsi_wl_surface->display,
+                                                    wsi_device),
          .create_mem = wsi_wl_create_ahb_image_mem,
       };
       buffer_type = WSI_WL_BUFFER_AHB;
@@ -4491,10 +4558,28 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       chain->images[i].busy = false;
    }
 
-   if (buffer_type == WSI_WL_BUFFER_AHB &&
-       wl_display_roundtrip_queue(dpy->wl_display, dpy->queue) < 0) {
-      result = VK_ERROR_SURFACE_LOST_KHR;
-      goto fail_free_wl_images;
+   if (buffer_type == WSI_WL_BUFFER_AHB) {
+      /* All import_buffer requests are ordered before this sync request.  A
+       * roundtrip used to wait here for the compositor even though the
+       * requests are safe to queue asynchronously; the first present will
+       * still observe the same ordering on the Wayland connection.  Keep the
+       * callback alive until the compositor has consumed the requests so
+       * protocol errors can be observed by the normal event dispatch path. */
+      chain->ahb_import_callback = wl_display_sync(dpy->wl_display_wrapper);
+      if (!chain->ahb_import_callback) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto fail_free_wl_images;
+      }
+      wl_callback_add_listener(chain->ahb_import_callback,
+                               &ahb_import_listener, chain);
+
+      /* Flush now to avoid retaining the AHB handle fds in wayland-client's
+       * outgoing queue.  EAGAIN is expected for a temporarily full socket;
+       * the next WSI request will retry the flush. */
+      if (wl_display_flush(dpy->wl_display) < 0 && errno != EAGAIN) {
+         result = VK_ERROR_SURFACE_LOST_KHR;
+         goto fail_free_wl_images;
+      }
    }
 
    chain->present_ids.valid_refresh_nsec = false;

@@ -486,7 +486,7 @@ configure_image(const struct wsi_swapchain *chain,
          return result;
 
       info->image_type = WSI_IMAGE_TYPE_AHB;
-      info->explicit_sync = false;
+      info->explicit_sync = ahb_params->explicit_sync;
       info->wsi.scanout = true;
       info->create.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
       info->usage2.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
