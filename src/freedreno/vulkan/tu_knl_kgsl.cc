@@ -281,6 +281,11 @@ kgsl_bo_init(struct tu_device *dev,
    ret = safe_ioctl(dev->physical_device->local_fd,
                     IOCTL_KGSL_GPUMEM_ALLOC_ID, &req);
    if (ret) {
+      fprintf(stderr,
+              "WL-MEM-DIAG: GPUMEM_ALLOC_ID size=%llu prop=0x%x flags=0x%x "
+              "errno=%d (%s)\n",
+              (unsigned long long)size, mem_property, req.flags, errno,
+              strerror(errno));
       return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                        "GPUMEM_ALLOC_ID failed (%s)", strerror(errno));
    }
@@ -340,8 +345,12 @@ kgsl_bo_init_dmabuf(struct tu_device *dev,
    };
    int ret;
 
+   fprintf(stderr, "WL-AHB-DIAG: kgsl import fd=%d size=%llu\n", fd,
+           (unsigned long long)size);
    ret = safe_ioctl(dev->physical_device->local_fd,
                     IOCTL_KGSL_GPUOBJ_IMPORT, &req);
+   fprintf(stderr, "WL-AHB-DIAG: kgsl import ret=%d errno=%d id=%u\n", ret,
+           ret ? errno : 0, ret ? 0 : req.id);
    if (ret)
       return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                        "Failed to import dma-buf (%s)\n", strerror(errno));
@@ -352,6 +361,8 @@ kgsl_bo_init_dmabuf(struct tu_device *dev,
 
    ret = safe_ioctl(dev->physical_device->local_fd,
                     IOCTL_KGSL_GPUOBJ_INFO, &info_req);
+   fprintf(stderr, "WL-AHB-DIAG: kgsl info ret=%d errno=%d size=%llu\n", ret,
+           ret ? errno : 0, (unsigned long long)info_req.size);
    if (ret)
       return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                        "Failed to get dma-buf info (%s)\n", strerror(errno));
@@ -404,8 +415,14 @@ kgsl_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
                  bo->shared_fd, 0);
    }
 
-   if (map == MAP_FAILED)
+   if (map == MAP_FAILED) {
+      fprintf(stderr,
+              "WL-MEM-DIAG: bo_map FAILED size=%llu shared_fd=%d gem=%u "
+              "placed=%p errno=%d (%s)\n",
+              (unsigned long long)bo->size, bo->shared_fd, bo->gem_handle,
+              placed_addr, errno, strerror(errno));
       return vk_error(dev, VK_ERROR_MEMORY_MAP_FAILED);
+   }
 
    bo->map = map;
    TU_RMV(bo_map, dev, bo);

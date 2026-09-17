@@ -59,7 +59,7 @@ if dep_libdrm.found()
   vulkan_lite_runtime_deps += dep_libdrm
 endif
 
-if with_platform_android
+if with_android
   vulkan_lite_runtime_files += files('vk_android.c')
   vulkan_lite_runtime_deps += [dep_android, idep_u_gralloc]
 endif

@@ -31,6 +31,7 @@
 #include <string.h>
 #include <poll.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 
@@ -184,6 +185,7 @@ struct wsi_wl_image {
    struct AHardwareBuffer *winfusion_ahb;
    uint32_t winfusion_stride;
    uint64_t winfusion_size;
+   uint64_t winfusion_modifier;
 
    struct wp_linux_drm_syncobj_timeline_v1 *wl_syncobj_timeline[WSI_ES_COUNT];
 };
@@ -3668,6 +3670,7 @@ struct winfusion_ahb_socket_header {
    uint32_t format;
    uint32_t stride;
    uint64_t size;
+   uint64_t modifier;
 };
 
 static bool
@@ -3766,13 +3769,48 @@ wsi_wl_ahb_image_supported(const struct wsi_device *wsi,
 
    VkResult result = wsi->GetPhysicalDeviceImageFormatProperties2(
       wsi->pdevice, &format_info, &format_props);
-   return result == VK_SUCCESS &&
-          create_info->imageExtent.width <=
-             format_props.imageFormatProperties.maxExtent.width &&
-          create_info->imageExtent.height <=
-             format_props.imageFormatProperties.maxExtent.height &&
-          (external_props.externalMemoryProperties.externalMemoryFeatures &
-           VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT);
+   bool supported =
+      result == VK_SUCCESS &&
+      create_info->imageExtent.width <=
+         format_props.imageFormatProperties.maxExtent.width &&
+      create_info->imageExtent.height <=
+         format_props.imageFormatProperties.maxExtent.height &&
+      (external_props.externalMemoryProperties.externalMemoryFeatures &
+       VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT);
+   fprintf(stderr,
+           "WL-AHB-DIAG: supported result=%d maxExtent=%dx%d extmem=0x%x usage=0x%llx flags=0x%x -> %d\n",
+           result, format_props.imageFormatProperties.maxExtent.width,
+           format_props.imageFormatProperties.maxExtent.height,
+           external_props.externalMemoryProperties.externalMemoryFeatures,
+           (unsigned long long) usage, flags, supported);
+   return supported;
+}
+
+/* The compositor derives the buffer size and DRM modifier from the
+ * AHardwareBuffer's native handle, so the client has to report the exact same
+ * values in the socket header.  Mirror the compositor's inspection: the size
+ * is the dma-buf's length and the modifier is UBWC-compressed only when the
+ * gralloc flag is set, anything else being linear. */
+static bool
+wsi_wl_ahb_get_layout(AHardwareBuffer *ahb, uint64_t *size, uint64_t *modifier)
+{
+   const native_handle_t *handle = AHardwareBuffer_getNativeHandle(ahb);
+   const uint32_t qcom_magic = ('g' << 24) | ('m' << 16) | ('s' << 8) | 'm';
+   struct stat statbuf;
+
+   if (!handle || handle->numFds < 1 || handle->numInts < 2)
+      return false;
+
+   if ((uint32_t)handle->data[handle->numFds] != qcom_magic)
+      return false;
+
+   if (fstat(handle->data[0], &statbuf) < 0 || statbuf.st_size <= 0)
+      return false;
+
+   *size = statbuf.st_size;
+   *modifier = (handle->data[handle->numFds + 1] & 0x08000000) ?
+      DRM_FORMAT_MOD_QCOM_COMPRESSED : DRM_FORMAT_MOD_LINEAR;
+   return true;
 }
 
 static VkResult
@@ -3808,11 +3846,15 @@ wsi_wl_create_ahb_image_mem(const struct wsi_swapchain *wsi_chain,
       .memoryTypeIndex = 0,
    };
 
+   fprintf(stderr, "WL-AHB-DIAG: create_mem enter\n");
    VkResult result = wsi->AllocateMemory(wsi_chain->device, &memory_info,
-                                         &wsi_chain->alloc,
-                                         &base_image->memory);
-   if (result != VK_SUCCESS)
+                                          &wsi_chain->alloc,
+                                          &base_image->memory);
+   if (result != VK_SUCCESS) {
+      fprintf(stderr, "WL-AHB-DIAG: AllocateMemory -> %d\n", result);
       return result;
+   }
+   fprintf(stderr, "WL-AHB-DIAG: AllocateMemory ok\n");
 
    const VkMemoryGetAndroidHardwareBufferInfoANDROID get_info = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_GET_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,
@@ -3820,26 +3862,37 @@ wsi_wl_create_ahb_image_mem(const struct wsi_swapchain *wsi_chain,
    };
    result = wsi->GetMemoryAndroidHardwareBufferANDROID(
       wsi_chain->device, &get_info, &image->winfusion_ahb);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      fprintf(stderr, "WL-AHB-DIAG: GetMemoryAHB -> %d\n", result);
       return result;
+   }
+   fprintf(stderr, "WL-AHB-DIAG: GetMemoryAHB ok\n");
 
    AHardwareBuffer_Desc desc;
    AHardwareBuffer_describe(image->winfusion_ahb, &desc);
    image->winfusion_stride =
       desc.stride * vk_format_get_blocksize(info->create.format);
-   image->winfusion_size =
-      (uint64_t)image->winfusion_stride * desc.height;
+   fprintf(stderr, "WL-AHB-DIAG: describe stride=%u pixstride=%u\n",
+           desc.stride, image->winfusion_stride);
+
+   /* The compositor validates the reported size and modifier against the
+    * AHardwareBuffer's native handle, so derive them here the same way. */
+   if (!wsi_wl_ahb_get_layout(image->winfusion_ahb, &image->winfusion_size,
+                              &image->winfusion_modifier)) {
+      fprintf(stderr, "WL-AHB-DIAG: get_layout failed\n");
+      AHardwareBuffer_release(image->winfusion_ahb);
+      image->winfusion_ahb = NULL;
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+   fprintf(stderr, "WL-AHB-DIAG: get_layout ok size=%llu mod=0x%llx\n",
+           (unsigned long long)image->winfusion_size,
+           (unsigned long long)image->winfusion_modifier);
 
    /* Explicit sync does not use the dma-buf's implicit fence state.  Avoid
     * keeping an otherwise unused fd per image on that path. */
    if (!info->explicit_sync) {
       const native_handle_t *handle =
          AHardwareBuffer_getNativeHandle(image->winfusion_ahb);
-      if (!handle || handle->numFds < 1) {
-         AHardwareBuffer_release(image->winfusion_ahb);
-         image->winfusion_ahb = NULL;
-         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
-      }
 
       base_image->dma_buf_fd = os_dupfd_cloexec(handle->data[0]);
       if (base_image->dma_buf_fd < 0) {
@@ -3847,10 +3900,6 @@ wsi_wl_create_ahb_image_mem(const struct wsi_swapchain *wsi_chain,
          image->winfusion_ahb = NULL;
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
-
-      off_t dma_buf_size = lseek(handle->data[0], 0, SEEK_END);
-      if (dma_buf_size > 0)
-         image->winfusion_size = dma_buf_size;
    }
 
    base_image->drm_modifier = DRM_FORMAT_MOD_INVALID;
@@ -3868,26 +3917,38 @@ wsi_wl_import_ahb_buffer(struct wsi_wl_swapchain *chain,
    struct wsi_wl_display *display = chain->wsi_wl_surface->display;
    const struct winfusion_ahb_socket_header header = {
       .magic = WINFUSION_AHB_SOCKET_MAGIC,
-      .version = 1,
+      .version = 2,
       .width = chain->extent.width,
       .height = chain->extent.height,
       .format = chain->drm_format,
       .stride = image->winfusion_stride,
       .size = image->winfusion_size,
+      .modifier = image->winfusion_modifier,
    };
    int sock[2];
 
    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sock) < 0)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-   if (!wsi_wl_write_full(sock[0], &header, sizeof(header)) ||
-       AHardwareBuffer_sendHandleToUnixSocket(image->winfusion_ahb,
+   if (!wsi_wl_write_full(sock[0], &header, sizeof(header))) {
+      fprintf(stderr, "WL-AHB-DIAG: write header failed\n");
+      close(sock[0]);
+      close(sock[1]);
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
+   if (AHardwareBuffer_sendHandleToUnixSocket(image->winfusion_ahb,
                                                sock[0]) != 0) {
+      fprintf(stderr, "WL-AHB-DIAG: sendHandleToUnixSocket failed\n");
       close(sock[0]);
       close(sock[1]);
       return VK_ERROR_INITIALIZATION_FAILED;
    }
    close(sock[0]);
+   fprintf(stderr, "WL-AHB-DIAG: header+fd sent, calling import_buffer %ux%u fmt=%u stride=%u size=%llu mod=0x%llx\n",
+           chain->extent.width, chain->extent.height, chain->drm_format,
+           image->winfusion_stride,
+           (unsigned long long)image->winfusion_size,
+           (unsigned long long)image->winfusion_modifier);
 
    struct wl_buffer *buffer =
       zwp_winfusion_buffer_v1_import_buffer(display->winfusion_buffer,
@@ -3896,8 +3957,11 @@ wsi_wl_import_ahb_buffer(struct wsi_wl_swapchain *chain,
                                             chain->drm_format,
                                             sock[1]);
    close(sock[1]);
-   if (!buffer)
+   if (!buffer) {
+      fprintf(stderr, "WL-AHB-DIAG: import_buffer returned NULL\n");
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   fprintf(stderr, "WL-AHB-DIAG: import_buffer returned %p\n", (void *)buffer);
 
    loader_wayland_wrap_buffer(&image->wayland_buffer, buffer);
    return VK_SUCCESS;
@@ -4338,6 +4402,14 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
          wsi_device->has_android_hardware_buffer &&
          wsi_device->GetMemoryAndroidHardwareBufferANDROID != NULL &&
          wsi_wl_ahb_image_supported(wsi_device, pCreateInfo);
+      fprintf(stderr,
+              "WL-AHB-DIAG: gate version=%u sw=%d has_ahb=%d get_mem_ahb=%p fmt=%d format=%dx%d -> use=%d\n",
+              version, wsi_device->sw, wsi_device->has_android_hardware_buffer,
+              (void *)wsi_device->GetMemoryAndroidHardwareBufferANDROID,
+              pCreateInfo->imageFormat, pCreateInfo->imageExtent.width,
+              pCreateInfo->imageExtent.height, use_winfusion_ahb);
+   } else {
+      fprintf(stderr, "WL-AHB-DIAG: winfusion_buffer global not bound\n");
    }
 #endif
 

@@ -542,6 +542,13 @@ vk_common_MapMemory(VkDevice _device,
       .size = size,
    };
 
+   fprintf(stderr,
+           "WL-MEM-DIAG: vk_common_MapMemory device=%p mem=%p offset=%llu "
+           "size=%llu flags=0x%x -> dispatch %p\n",
+           (void *)device, (void *)memory, (unsigned long long)offset,
+           (unsigned long long)size, (unsigned)flags,
+           (void *)device->dispatch_table.MapMemory2KHR);
+
    return device->dispatch_table.MapMemory2KHR(_device, &info, ppData);
 }
 

@@ -145,7 +145,16 @@ vk_gralloc_to_drm_explicit_layout(
    struct u_gralloc *u_gralloc = vk_android_get_ugralloc();
    assert(u_gralloc);
 
-   if (u_gralloc_get_buffer_basic_info(u_gralloc, in_hnd, &info) != 0)
+   fprintf(stderr, "WL-AHB-DIAG: gralloc get_info enter type=%d hal_fmt=0x%x stride=%u\n",
+           u_gralloc_get_type(u_gralloc), in_hnd->hal_format,
+           in_hnd->pixel_stride);
+   int gr_ret = u_gralloc_get_buffer_basic_info(u_gralloc, in_hnd, &info);
+   fprintf(stderr,
+           "WL-AHB-DIAG: gralloc get_info ret=%d fourcc=0x%x mod=0x%llx planes=%d\n",
+           gr_ret, gr_ret ? 0 : info.drm_fourcc,
+           gr_ret ? 0ULL : (unsigned long long)info.modifier,
+           gr_ret ? 0 : info.num_planes);
+   if (gr_ret != 0)
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 
    if (info.num_planes > max_planes)
@@ -861,7 +870,12 @@ vk_alloc_ahardware_buffer(const VkMemoryAllocateInfo *pAllocateInfo)
     };
 
    struct AHardwareBuffer *ahb;
-   if (AHardwareBuffer_allocate(&desc, &ahb) != 0)
+   fprintf(stderr, "WL-AHB-DIAG: ahb_alloc enter %ux%u fmt=0x%x usage=0x%llx\n",
+           w, h, format, (unsigned long long)usage);
+   int alloc_ret = AHardwareBuffer_allocate(&desc, &ahb);
+   fprintf(stderr, "WL-AHB-DIAG: ahb_alloc ret=%d ahb=%p\n", alloc_ret,
+           (void *)ahb);
+   if (alloc_ret != 0)
       return NULL;
 
    return ahb;

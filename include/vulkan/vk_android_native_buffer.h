@@ -17,7 +17,7 @@
  * system rather the build target.
  */
 
-#if 0
+#if defined(__ANDROID__) || defined(ANDROID)
 
 #include <cutils/native_handle.h>
 #if ANDROID_API_LEVEL < 28

@@ -50,11 +50,41 @@
 #include "wsi_common.h"
 #endif
 
-#if DETECT_OS_ANDROID && defined(ANDROID)
+#if DETECT_OS_ANDROID
 #include <vndk/hardware_buffer.h>
+#include <unwind.h>
+#include <dlfcn.h>
 #endif
 
 uint64_t os_page_size = 4096;
+
+#if DETECT_OS_ANDROID
+static _Unwind_Reason_Code
+wl_bt_cb(struct _Unwind_Context *ctx, void *arg)
+{
+   int *n = (int *)arg;
+   uintptr_t ip = _Unwind_GetIP(ctx);
+   Dl_info info;
+
+   if (ip && dladdr((void *)ip, &info)) {
+      fprintf(stderr, "WL-MEM-DIAG:   bt[%d] ip=%p %s +0x%lx (%s)\n", *n,
+              (void *)ip, info.dli_fname ? info.dli_fname : "?",
+              info.dli_fbase ? (unsigned long)(ip - (uintptr_t)info.dli_fbase) : 0,
+              info.dli_sname ? info.dli_sname : "?");
+   } else {
+      fprintf(stderr, "WL-MEM-DIAG:   bt[%d] ip=%p ?\n", *n, (void *)ip);
+   }
+
+   return ++(*n) < 12 ? _URC_NO_REASON : _URC_END_OF_STACK;
+}
+
+static void
+wl_dump_backtrace(void)
+{
+   int n = 0;
+   _Unwind_Backtrace(wl_bt_cb, &n);
+}
+#endif
 
 static bool
 tu_device_get_build_id(blake3_hasher *ctx)
@@ -3708,12 +3738,21 @@ tu_AllocateMemory(VkDevice _device,
          close(fd_info->fd);
       }
    } else if (mem->vk.ahardware_buffer) {
-#if DETECT_OS_ANDROID && defined(ANDROID)
+#if DETECT_OS_ANDROID
       const native_handle_t *handle = AHardwareBuffer_getNativeHandle(mem->vk.ahardware_buffer);
-      assert(handle->numFds > 0);
+      fprintf(stderr, "WL-AHB-DIAG: tu_alloc_mem ahb=%p handle=%p\n",
+              (void *)mem->vk.ahardware_buffer, (const void *)handle);
+      if (handle == NULL || handle->numFds < 1) {
+         fprintf(stderr, "WL-AHB-DIAG: tu_alloc_mem bad handle, aborting\n");
+         result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      } else {
       size_t size = lseek(handle->data[0], 0, SEEK_END);
+      fprintf(stderr, "WL-AHB-DIAG: tu_alloc_mem numFds=%d fd=%d lseek=%zu\n",
+              handle->numFds, handle->data[0], size);
       result = tu_bo_init_dmabuf(device, &mem->bo, size, alloc_flags,
                                  handle->data[0]);
+      fprintf(stderr, "WL-AHB-DIAG: tu_bo_init_dmabuf -> %d\n", result);
+      }
 #else
       result = VK_ERROR_FEATURE_NOT_PRESENT;
 #endif
@@ -3745,11 +3784,22 @@ tu_AllocateMemory(VkDevice _device,
       result = _tu_init_memory(device, mem, mem_property, alloc_flags,
                                pAllocateInfo->allocationSize, client_address,
                                name);
+      fprintf(stderr,
+              "WL-MEM-DIAG: alloc size=%llu type=%u prop=0x%x flags=0x%x "
+              "-> _tu_init_memory=%d\n",
+              (unsigned long long)pAllocateInfo->allocationSize,
+              pAllocateInfo->memoryTypeIndex, mem_property,
+              (unsigned)alloc_flags, result);
    }
 
    if (result == VK_SUCCESS && !mem->lazy) {
       result = tu_add_to_heap(device, mem->bo);
       mem->iova = mem->bo->iova;
+      fprintf(stderr,
+              "WL-MEM-DIAG: add_to_heap size=%llu used=%llu heap=%llu -> %d\n",
+              (unsigned long long)mem->bo->size,
+              (unsigned long long)p_atomic_read(&device->physical_device->heap.used),
+              (unsigned long long)device->physical_device->heap.size, result);
    }
 
    if (result != VK_SUCCESS) {
@@ -3882,9 +3932,34 @@ tu_MapMemory2KHR(VkDevice _device, const VkMemoryMapInfoKHR *pMemoryMapInfo, voi
    VK_FROM_HANDLE(tu_device_memory, mem, pMemoryMapInfo->memory);
    VkResult result;
 
+   fprintf(stderr,
+           "WL-MEM-DIAG: MapMemory ENTER mem=%p bo=%p offset=%llu size=%llu "
+           "flags=0x%x\n",
+           (void *)mem, mem ? (void *)mem->bo : NULL,
+           (unsigned long long)pMemoryMapInfo->offset,
+           (unsigned long long)pMemoryMapInfo->size,
+           (unsigned)pMemoryMapInfo->flags);
+#if DETECT_OS_ANDROID
+   {
+      static int wl_map_bt_count = 0;
+      if (wl_map_bt_count < 3) {
+         wl_map_bt_count++;
+         wl_dump_backtrace();
+      }
+   }
+#endif
+
    if (mem == NULL) {
       *ppData = NULL;
+      fprintf(stderr, "WL-MEM-DIAG: MapMemory EXIT null-mem -> 0 ptr=NULL\n");
       return VK_SUCCESS;
+   }
+
+   if (mem->bo == NULL) {
+      *ppData = NULL;
+      fprintf(stderr, "WL-MEM-DIAG: MapMemory EXIT null-bo -> %d\n",
+              VK_ERROR_OUT_OF_HOST_MEMORY);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
 
    void *placed_addr = NULL;
@@ -3896,10 +3971,18 @@ tu_MapMemory2KHR(VkDevice _device, const VkMemoryMapInfoKHR *pMemoryMapInfo, voi
    }
 
    result = tu_bo_map(device, mem->bo, placed_addr);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      fprintf(stderr,
+              "WL-MEM-DIAG: MapMemory bo=%p size=%llu shared_fd=%d gem=%u "
+              "placed=%p -> %d\n",
+              (void *)mem->bo, (unsigned long long)mem->bo->size,
+              mem->bo->shared_fd, mem->bo->gem_handle, placed_addr, result);
       return result;
+   }
 
    *ppData = (char *) mem->bo->map + pMemoryMapInfo->offset;
+   fprintf(stderr, "WL-MEM-DIAG: MapMemory EXIT ok bo=%p map=%p ptr=%p\n",
+           (void *)mem->bo, mem->bo->map, *ppData);
    return VK_SUCCESS;
 }
 
