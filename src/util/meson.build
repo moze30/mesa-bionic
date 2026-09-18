@@ -6,7 +6,7 @@
 # util is self contained.
 inc_util = [inc_include, include_directories('..')]
 
-if with_platform_android
+if with_android
 subdir('u_gralloc')
 endif
 
@@ -319,7 +319,11 @@ if dep_libdrm.found()
   deps_for_libmesa_util += dep_libdrm
 endif
 
-if with_platform_android
+# with_android, not with_platform_android: libmesa_util is where the symbols
+# the Android libraries export have to come from, and a Bionic target needs
+# them regardless of which window system it builds. u_debug_stack_android.cpp
+# is the bionic stack unwinder and is equally needed there.
+if with_android
   deps_for_libmesa_util += dep_android
   files_debug_stack = files('u_debug_stack_android.cpp')
 else
