@@ -487,6 +487,20 @@ with_platform_haiku = _platforms.contains('haiku')
 with_platform_windows = _platforms.contains('windows')
 with_platform_macos = _platforms.contains('macos')
 
+# WinFusion: the target toolchain being Android is a separate concern from
+# exposing the Android windowing platform (EGL/GBM).  The private
+# zwp_winfusion_buffer_v1 path only needs the Android AHardwareBuffer API, so
+# detect the toolchain independently and drive the Vulkan/WSI Android support
+# from it.  This lets the production Wayland-only configuration compile the
+# zero-copy path without pulling in the Android EGL platform.
+with_android_toolchain = cc.compiles('''
+#ifndef __ANDROID__
+#error not an Android target
+#endif
+int main(void) { return 0; }
+''')
+with_android = with_platform_android or with_android_toolchain
+
 with_gfxstream_emulated_android = with_gfxstream_vk and with_platform_android and host_machine.system() == 'linux'
 if with_gfxstream_emulated_android
   # When building the android_stub with a non-Bionic sysroot/target, we to have
@@ -614,7 +628,7 @@ foreach platform : _platforms
   pre_args += '-DHAVE_@0@_PLATFORM'.format(platform.to_upper())
 endforeach
 
-if with_platform_android and get_option('platform-sdk-version') >= 29
+if with_android
   # By default the NDK compiler, at least, emits emutls references instead of
   # ELF TLS, even when building targeting newer API levels.  Make it actually do
   # ELF TLS instead.
@@ -1029,18 +1043,19 @@ if not with_glx_indirect_rendering
 endif
 pre_args += '-DGLAPI_EXPORT_PROTO_ENTRY_POINTS=@0@'.format(with_glapi_export_proto_entry_points.to_int())
 
-with_android_stub = get_option('android-stub')
-need_android_stub = with_platform_android or with_gfxstream_emulated_android
+with_android_stub = get_option('android-stub') or \
+  (with_android_toolchain and not with_platform_android)
+need_android_stub = with_android or with_gfxstream_emulated_android
 if with_android_stub and not need_android_stub
-  error('`-D android-stub=true` makes no sense without `-D platforms=android` or emulated Android')
+  error('`-D android-stub=true` makes no sense without an Android target')
 endif
 
 with_libbacktrace = get_option('android-libbacktrace') \
-  .require(with_platform_android, error_message : '`-D android-libbacktrace=enabled` makes no sense without `-D platforms=android`') \
-  .disable_auto_if(not with_platform_android) \
+  .require(with_android, error_message : '`-D android-libbacktrace=enabled` makes no sense without an Android target') \
+  .disable_auto_if(not with_android) \
   .allowed()
 
-if with_platform_android
+if with_android
   dep_android_ui = null_dep
   dep_android_mapper4 = null_dep
   if not with_android_stub
@@ -1609,7 +1624,7 @@ if not ['linux'].contains(host_machine.system())
   endif
 endif
 
-foreach h : ['linux/futex.h', 'endian.h', 'dlfcn.h', 'sys/shm.h',
+foreach h : ['xlocale.h', 'linux/futex.h', 'endian.h', 'dlfcn.h', 'sys/shm.h',
              'cet.h', 'pthread_np.h', 'poll.h', 'sys/inotify.h',
              'linux/udmabuf.h']
   if cc.check_header(h)
@@ -1620,9 +1635,11 @@ endforeach
 functions_to_detect = {
   'strtof': '',
   'mkostemp': '',
+  'memfd_create': '#include <sys/mman.h>',
   'random_r': '',
   'flock': '',
   'strtok_r': '',
+  'getrandom': '#include <sys/random.h>',
   'qsort_s': '',
   'posix_fallocate': '',
   'secure_getenv': '',
@@ -1944,6 +1961,18 @@ foreach d : _libdrm_checks
     )
   endif
 endforeach
+
+# The Bionic sysroot's <sys/shm.h> may be shadowed by a Termux-style one that
+# redirects shmget()/shmat()/... to libandroid-shmem.  Link against it when the
+# Android target is built so the sw winsys resolves those symbols.
+dep_android_shmem = null_dep
+if with_android and dep_libdrm.found()
+  _android_shmem_libdir = dep_libdrm.get_variable(pkgconfig : 'libdir')
+  if _android_shmem_libdir != ''
+    dep_android_shmem = declare_dependency(
+      link_args : ['-L' + _android_shmem_libdir, '-l:libandroid-shmem.so'])
+  endif
+endif
 
 dep_libudev = dependency('libudev', required : false)
 if dep_libudev.found()
