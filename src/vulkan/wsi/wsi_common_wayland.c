@@ -31,6 +31,7 @@
 #include <string.h>
 #include <poll.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 
@@ -184,6 +185,7 @@ struct wsi_wl_image {
    struct AHardwareBuffer *winfusion_ahb;
    uint32_t winfusion_stride;
    uint64_t winfusion_size;
+   uint64_t winfusion_modifier;
 
    struct wp_linux_drm_syncobj_timeline_v1 *wl_syncobj_timeline[WSI_ES_COUNT];
 };
@@ -1810,6 +1812,16 @@ wsi_wl_surface_get_support(VkIcdSurfaceBase *surface,
 
 /* Catch-all. 3 images is a sound default for everything except MAILBOX. */
 #define WSI_WL_DEFAULT_NUM_IMAGES 3
+
+/* The private AHB path hands the compositor an image and cannot reuse it until
+ * that frame has been released, and the compositor only processes releases on
+ * its repaint tick. An application rendering far faster than the compositor
+ * therefore drains the pool and blocks in AcquireNextImage for most of a
+ * refresh interval. A deeper pool lets several frames be in flight between
+ * ticks, which lifts the achievable frame rate roughly proportionally to the
+ * pool size. WINFUSION_WSI_AHB_IMAGES overrides the default for tuning. */
+#define WSI_WL_AHB_NUM_IMAGES_DEFAULT 16
+#define WSI_WL_AHB_NUM_IMAGES_MAX 32
 
 static uint32_t
 wsi_wl_surface_get_min_image_count(struct wsi_wl_display *display,
@@ -3668,6 +3680,7 @@ struct winfusion_ahb_socket_header {
    uint32_t format;
    uint32_t stride;
    uint64_t size;
+   uint64_t modifier;
 };
 
 static bool
@@ -3766,13 +3779,42 @@ wsi_wl_ahb_image_supported(const struct wsi_device *wsi,
 
    VkResult result = wsi->GetPhysicalDeviceImageFormatProperties2(
       wsi->pdevice, &format_info, &format_props);
-   return result == VK_SUCCESS &&
-          create_info->imageExtent.width <=
-             format_props.imageFormatProperties.maxExtent.width &&
-          create_info->imageExtent.height <=
-             format_props.imageFormatProperties.maxExtent.height &&
-          (external_props.externalMemoryProperties.externalMemoryFeatures &
-           VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT);
+   bool supported =
+      result == VK_SUCCESS &&
+      create_info->imageExtent.width <=
+         format_props.imageFormatProperties.maxExtent.width &&
+      create_info->imageExtent.height <=
+         format_props.imageFormatProperties.maxExtent.height &&
+       (external_props.externalMemoryProperties.externalMemoryFeatures &
+        VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT);
+   return supported;
+}
+
+/* The compositor derives the buffer size and DRM modifier from the
+ * AHardwareBuffer's native handle, so the client has to report the exact same
+ * values in the socket header.  Mirror the compositor's inspection: the size
+ * is the dma-buf's length and the modifier is UBWC-compressed only when the
+ * gralloc flag is set, anything else being linear. */
+static bool
+wsi_wl_ahb_get_layout(AHardwareBuffer *ahb, uint64_t *size, uint64_t *modifier)
+{
+   const native_handle_t *handle = AHardwareBuffer_getNativeHandle(ahb);
+   const uint32_t qcom_magic = ('g' << 24) | ('m' << 16) | ('s' << 8) | 'm';
+   struct stat statbuf;
+
+   if (!handle || handle->numFds < 1 || handle->numInts < 2)
+      return false;
+
+   if ((uint32_t)handle->data[handle->numFds] != qcom_magic)
+      return false;
+
+   if (fstat(handle->data[0], &statbuf) < 0 || statbuf.st_size <= 0)
+      return false;
+
+   *size = statbuf.st_size;
+   *modifier = (handle->data[handle->numFds + 1] & 0x08000000) ?
+      DRM_FORMAT_MOD_QCOM_COMPRESSED : DRM_FORMAT_MOD_LINEAR;
+   return true;
 }
 
 static VkResult
@@ -3827,19 +3869,21 @@ wsi_wl_create_ahb_image_mem(const struct wsi_swapchain *wsi_chain,
    AHardwareBuffer_describe(image->winfusion_ahb, &desc);
    image->winfusion_stride =
       desc.stride * vk_format_get_blocksize(info->create.format);
-   image->winfusion_size =
-      (uint64_t)image->winfusion_stride * desc.height;
+
+   /* The compositor validates the reported size and modifier against the
+    * AHardwareBuffer's native handle, so derive them here the same way. */
+   if (!wsi_wl_ahb_get_layout(image->winfusion_ahb, &image->winfusion_size,
+                              &image->winfusion_modifier)) {
+      AHardwareBuffer_release(image->winfusion_ahb);
+      image->winfusion_ahb = NULL;
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
 
    /* Explicit sync does not use the dma-buf's implicit fence state.  Avoid
     * keeping an otherwise unused fd per image on that path. */
    if (!info->explicit_sync) {
       const native_handle_t *handle =
          AHardwareBuffer_getNativeHandle(image->winfusion_ahb);
-      if (!handle || handle->numFds < 1) {
-         AHardwareBuffer_release(image->winfusion_ahb);
-         image->winfusion_ahb = NULL;
-         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
-      }
 
       base_image->dma_buf_fd = os_dupfd_cloexec(handle->data[0]);
       if (base_image->dma_buf_fd < 0) {
@@ -3847,10 +3891,6 @@ wsi_wl_create_ahb_image_mem(const struct wsi_swapchain *wsi_chain,
          image->winfusion_ahb = NULL;
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
-
-      off_t dma_buf_size = lseek(handle->data[0], 0, SEEK_END);
-      if (dma_buf_size > 0)
-         image->winfusion_size = dma_buf_size;
    }
 
    base_image->drm_modifier = DRM_FORMAT_MOD_INVALID;
@@ -3868,12 +3908,13 @@ wsi_wl_import_ahb_buffer(struct wsi_wl_swapchain *chain,
    struct wsi_wl_display *display = chain->wsi_wl_surface->display;
    const struct winfusion_ahb_socket_header header = {
       .magic = WINFUSION_AHB_SOCKET_MAGIC,
-      .version = 1,
+      .version = 2,
       .width = chain->extent.width,
       .height = chain->extent.height,
       .format = chain->drm_format,
       .stride = image->winfusion_stride,
       .size = image->winfusion_size,
+      .modifier = image->winfusion_modifier,
    };
    int sock[2];
 
@@ -4404,6 +4445,20 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
        present_mode != VK_PRESENT_MODE_FIFO_KHR &&
        present_mode != VK_PRESENT_MODE_FIFO_RELAXED_KHR)
       num_images = MAX2(num_images, WSI_WL_SHM_NUM_IMAGES);
+
+   /* Same reasoning for the private AHB path: it is paced by the compositor's
+    * release cadence, so a deeper pool keeps AcquireNextImage from blocking.
+    * FIFO modes are intentionally excluded: a deep FIFO queue adds latency
+    * without helping throughput. */
+   if (buffer_type == WSI_WL_BUFFER_AHB &&
+       present_mode != VK_PRESENT_MODE_FIFO_KHR &&
+       present_mode != VK_PRESENT_MODE_FIFO_RELAXED_KHR) {
+      uint32_t ahb_images = CLAMP(
+         debug_get_num_option("WINFUSION_WSI_AHB_IMAGES",
+                              WSI_WL_AHB_NUM_IMAGES_DEFAULT),
+         1, WSI_WL_AHB_NUM_IMAGES_MAX);
+      num_images = MAX2(num_images, ahb_images);
+   }
 
    result = wsi_swapchain_init(wsi_device, &chain->base, device,
                                pCreateInfo, image_params, pAllocator);
