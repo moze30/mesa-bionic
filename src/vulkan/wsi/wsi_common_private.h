@@ -265,6 +265,15 @@ struct wsi_swapchain {
     */
    VkSemaphore dma_buf_semaphore;
 
+   /**
+    * When true, dma_buf_semaphore is not imported into the image's dma-buf.
+    * Instead the WSI backend exports it as a sync file and hands it to the
+    * window system as an acquire fence, which is how swapchains without
+    * kernel dma-buf sync-file support (e.g. Android KGSL) tell the compositor
+    * to wait for the client's rendering.
+    */
+   bool semaphore_as_acquire_fence;
+
    struct wsi_image_info image_info;
    uint32_t image_count;
 
@@ -522,6 +531,10 @@ wsi_drm_wait_for_explicit_sync_release(struct wsi_swapchain *chain,
 
 VkResult
 wsi_drm_init_swapchain_implicit_sync(struct wsi_swapchain *chain);
+
+VkResult
+wsi_drm_init_ahb_implicit_sync(struct wsi_swapchain *chain, int dma_buf_fd,
+                               bool have_explicit_sync);
 
 #endif
 

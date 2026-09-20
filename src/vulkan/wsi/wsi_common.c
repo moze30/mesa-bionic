@@ -2897,7 +2897,8 @@ wsi_common_queue_present(const struct wsi_device *wsi,
        * attach it to the dma-buf before we present so that the present
        * implicitly syncs on it.
        */
-      if (swapchain->dma_buf_semaphore != VK_NULL_HANDLE) {
+      if (swapchain->dma_buf_semaphore != VK_NULL_HANDLE &&
+          !swapchain->semaphore_as_acquire_fence) {
 #ifdef HAVE_LIBDRM
          assert(!swapchain->image_info.explicit_sync);
          results[i] = wsi_signal_dma_buf_from_semaphore(swapchain, image);

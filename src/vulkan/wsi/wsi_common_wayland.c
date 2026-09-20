@@ -50,6 +50,7 @@
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "presentation-time-client-protocol.h"
 #include "linux-drm-syncobj-v1-client-protocol.h"
+#include "linux-explicit-synchronization-unstable-v1-client-protocol.h"
 #include "tearing-control-v1-client-protocol.h"
 #include "color-management-v1-client-protocol.h"
 #include "winfusion-protocol/winfusion-buffer-v1-client-protocol.h"
@@ -128,6 +129,7 @@ struct wsi_wl_display {
    struct zwp_linux_dmabuf_feedback_v1 *wl_dmabuf_feedback;
    struct wp_tearing_control_manager_v1 *tearing_control_manager;
    struct wp_linux_drm_syncobj_manager_v1 *wl_syncobj;
+   struct zwp_linux_explicit_synchronization_v1 *wl_explicit_sync;
 
    struct wp_color_manager_v1 *color_manager;
 
@@ -236,6 +238,9 @@ struct wsi_wl_swapchain {
    struct wp_fifo_v1 *fifo;
    struct wp_commit_timer_v1 *commit_timer;
    struct wp_linux_drm_syncobj_surface_v1 *wl_syncobj_surface;
+   /* Acquire-fence explicit sync used when dma-buf implicit sync is
+    * unavailable (Android KGSL). */
+   struct zwp_linux_surface_synchronization_v1 *wl_surface_sync;
 
    struct wl_callback *frame;
    /* Completion barrier for asynchronous AHB import requests. */
@@ -1484,6 +1489,9 @@ registry_handle_global(void *data, struct wl_registry *registry,
       } else if (strcmp(interface, wp_linux_drm_syncobj_manager_v1_interface.name) == 0) {
          display->wl_syncobj =
             wl_registry_bind(registry, name, &wp_linux_drm_syncobj_manager_v1_interface, 1);
+      } else if (strcmp(interface, zwp_linux_explicit_synchronization_v1_interface.name) == 0) {
+         display->wl_explicit_sync =
+            wl_registry_bind(registry, name, &zwp_linux_explicit_synchronization_v1_interface, 1);
 #ifdef WL_FIXES_INTERFACE
       } else if (strcmp(interface, wl_fixes_interface.name) == 0) {
          display->wl_fixes =
@@ -1555,6 +1563,8 @@ wsi_wl_display_finish(struct wsi_wl_display *display)
       wl_shm_destroy(display->wl_shm);
    if (display->wl_syncobj)
       wp_linux_drm_syncobj_manager_v1_destroy(display->wl_syncobj);
+   if (display->wl_explicit_sync)
+      zwp_linux_explicit_synchronization_v1_destroy(display->wl_explicit_sync);
    if (display->wl_dmabuf)
       zwp_linux_dmabuf_v1_destroy(display->wl_dmabuf);
    if (display->winfusion_buffer)
@@ -3367,6 +3377,29 @@ wsi_wl_swapchain_present_now(struct wsi_swapchain *wsi_chain,
                                                         (uint32_t)(release_point & 0xffffffff));
    }
 
+   /* Hand the compositor the client's rendering-complete fence as an acquire
+    * fence.  The semaphore was signaled by the pre-present submit on the queue
+    * after waiting on the application's present wait semaphores; exporting it
+    * as a sync file transfers that fence to the compositor, which waits on it
+    * on the GPU.  No CPU blocking and no effect on the client's frame rate. */
+   if (chain->base.semaphore_as_acquire_fence && chain->wl_surface_sync &&
+       chain->base.dma_buf_semaphore != VK_NULL_HANDLE) {
+      const VkSemaphoreGetFdInfoKHR get_fd_info = {
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+         .semaphore = chain->base.dma_buf_semaphore,
+         .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+      };
+      int acquire_fd = -1;
+      VkResult get_res =
+         chain->base.wsi->GetSemaphoreFdKHR(chain->base.device, &get_fd_info,
+                                            &acquire_fd);
+      if (get_res == VK_SUCCESS && acquire_fd >= 0) {
+         zwp_linux_surface_synchronization_v1_set_acquire_fence(
+            chain->wl_surface_sync, acquire_fd);
+         close(acquire_fd);
+      }
+   }
+
    assert(image_index < chain->base.image_count);
    wl_surface_attach(wsi_wl_surface->wayland_surface.wrapper,
                      chain->images[image_index].wayland_buffer.buffer, 0, 0);
@@ -4170,6 +4203,8 @@ wsi_wl_swapchain_chain_free(struct wsi_wl_swapchain *chain,
       wp_tearing_control_v1_destroy(chain->tearing_control);
    if (chain->wl_syncobj_surface)
       wp_linux_drm_syncobj_surface_v1_destroy(chain->wl_syncobj_surface);
+   if (chain->wl_surface_sync)
+      zwp_linux_surface_synchronization_v1_destroy(chain->wl_surface_sync);
    if (chain->color.color_surface)
       wp_color_management_surface_v1_destroy(chain->color.color_surface);
 
@@ -4309,6 +4344,10 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       if (old_chain->wl_syncobj_surface) {
          wp_linux_drm_syncobj_surface_v1_destroy(old_chain->wl_syncobj_surface);
          old_chain->wl_syncobj_surface = NULL;
+      }
+      if (old_chain->wl_surface_sync) {
+         zwp_linux_surface_synchronization_v1_destroy(old_chain->wl_surface_sync);
+         old_chain->wl_surface_sync = NULL;
       }
       if (old_chain->color.color_surface) {
          wp_color_management_surface_v1_destroy(old_chain->color.color_surface);
@@ -4611,6 +4650,46 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       if (result != VK_SUCCESS)
          goto fail_free_wl_images;
       chain->images[i].busy = false;
+   }
+
+   /*
+    * AHB is zero-copy: the client renders straight into the buffer the
+    * compositor samples, so the compositor must not sample it before the
+    * client's GPU work has finished.  Prefer kernel dma-buf implicit sync;
+    * where the kernel cannot carry fences on the gralloc dma-buf, fall back to
+    * handing the compositor an explicit acquire fence (a sync file), which the
+    * GL renderer waits on in the GPU without blocking the CPU.
+    */
+   if (buffer_type == WSI_WL_BUFFER_AHB && !chain->base.image_info.explicit_sync) {
+      /* wp_linux_drm_syncobj is unavailable here (KGSL exposes no DRM device),
+       * so the compositor is told about the client's rendering-complete fence
+       * through the older zwp_linux_explicit_synchronization_v1 protocol,
+       * which winfusion's compositor always advertises. */
+      bool acquire_fence =
+         dpy->wl_explicit_sync != NULL &&
+         !wsi_device->sw &&
+         (wsi_device->semaphore_export_handle_types &
+          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT) != 0;
+#ifdef HAVE_LIBDRM
+      result = wsi_drm_init_ahb_implicit_sync(&chain->base,
+                                             chain->images[0].base.dma_buf_fd,
+                                             acquire_fence);
+      if (result != VK_SUCCESS)
+         goto fail_free_wl_images;
+      acquire_fence = chain->base.semaphore_as_acquire_fence;
+#else
+      (void) acquire_fence;
+#endif
+      if (acquire_fence) {
+         chain->wl_surface_sync =
+            zwp_linux_explicit_synchronization_v1_get_synchronization(
+               dpy->wl_explicit_sync,
+               chain->wsi_wl_surface->wayland_surface.wrapper);
+         if (!chain->wl_surface_sync) {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto fail_free_wl_images;
+         }
+      }
    }
 
    if (buffer_type == WSI_WL_BUFFER_AHB) {
